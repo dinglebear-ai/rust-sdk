@@ -14,7 +14,9 @@ use tracing::{Instrument, Level};
 use super::{IntoTransport, Transport};
 use crate::{
     model::{CancelledNotification, JsonRpcMessage, RequestId},
-    service::{RxJsonRpcMessage, ServiceRole, TxJsonRpcMessage},
+    service::{
+        RawRxJsonRpcMessage, RxJsonRpcMessage, ServiceRole, TxJsonRpcMessage, decode_peer_response,
+    },
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -35,6 +37,8 @@ pub enum WorkerQuitReason<E> {
     HandlerTerminated,
     #[error("Worker idle timeout after {}ms", _0.as_millis())]
     IdleTimeout(Duration),
+    #[error("failed to serialize peer response: {0}")]
+    ResponseSerialization(#[source] serde_json::Error),
 }
 
 impl<E: std::error::Error + Send + 'static> WorkerQuitReason<E> {
@@ -75,6 +79,10 @@ pub trait Worker: Sized + Send + 'static {
     ///
     /// Workers that opt in must honor [`WorkerSendRequest::cancellation_token`].
     fn supports_request_cancellation() -> bool {
+        false
+    }
+    /// Whether this worker sends inbound responses through the lossless raw path.
+    fn preserves_raw_responses() -> bool {
         false
     }
 }
@@ -167,7 +175,7 @@ impl<W: Worker> WorkerSendRequest<W> {
 }
 
 pub struct WorkerTransport<W: Worker> {
-    rx: tokio::sync::mpsc::Receiver<RxJsonRpcMessage<W::Role>>,
+    rx: tokio::sync::mpsc::Receiver<RawRxJsonRpcMessage<W::Role>>,
     send_service: tokio::sync::mpsc::Sender<WorkerSendRequest<W>>,
     control_send_service: tokio::sync::mpsc::Sender<WorkerSendRequest<W>>,
     request_cancellations: RequestCancellations,
@@ -214,12 +222,41 @@ impl<W: Worker> WorkerTransport<W> {
             tokio::sync::mpsc::channel::<WorkerSendRequest<W>>(config.channel_buffer_capacity);
         let (control_to_transport_tx, control_from_handler_rx) =
             tokio::sync::mpsc::channel::<WorkerSendRequest<W>>(config.channel_buffer_capacity);
-        let (to_handler_tx, from_transport_rx) =
+        let (raw_to_handler_tx, from_transport_rx) = tokio::sync::mpsc::channel::<
+            RawRxJsonRpcMessage<W::Role>,
+        >(config.channel_buffer_capacity);
+        let (to_handler_tx, mut legacy_from_transport_rx) =
             tokio::sync::mpsc::channel::<RxJsonRpcMessage<W::Role>>(config.channel_buffer_capacity);
+        let legacy_raw_tx = raw_to_handler_tx.clone();
+        tokio::spawn(async move {
+            while let Some(message) = legacy_from_transport_rx.recv().await {
+                let raw = match message {
+                    JsonRpcMessage::Request(request) => JsonRpcMessage::Request(request),
+                    JsonRpcMessage::Response(response) => JsonRpcMessage::Response(
+                        crate::model::JsonRpcResponse {
+                            jsonrpc: response.jsonrpc,
+                            id: response.id,
+                            result: serde_json::to_value(response.result).unwrap_or_else(|error| {
+                                tracing::error!(%error, "failed to serialize legacy worker response");
+                                serde_json::Value::Null
+                            }),
+                        },
+                    ),
+                    JsonRpcMessage::Notification(notification) => {
+                        JsonRpcMessage::Notification(notification)
+                    }
+                    JsonRpcMessage::Error(error) => JsonRpcMessage::Error(error),
+                };
+                if legacy_raw_tx.send(raw).await.is_err() {
+                    break;
+                }
+            }
+        });
         let request_cancellations = RequestCancellations::default();
         let control_generation = Arc::new(AtomicU64::new(0));
         let context = WorkerContext {
             to_handler_tx,
+            raw_to_handler_tx,
             from_handler_rx,
             control_from_handler_rx,
             control_generation: control_generation.clone(),
@@ -247,6 +284,9 @@ impl<W: Worker> WorkerTransport<W> {
                     }
                     WorkerQuitReason::Fatal { error, context } => {
                         tracing::error!("worker quit with fatal: {error}, when {context}");
+                    }
+                    WorkerQuitReason::ResponseSerialization(error) => {
+                        tracing::error!(%error, "worker failed to serialize peer response");
                     }
                 })
                 .inspect(|_| {
@@ -298,6 +338,7 @@ pub struct WorkerContext<W: Worker> {
     pub control_from_handler_rx: tokio::sync::mpsc::Receiver<WorkerSendRequest<W>>,
     pub cancellation_token: CancellationToken,
     control_generation: Arc<AtomicU64>,
+    raw_to_handler_tx: tokio::sync::mpsc::Sender<RawRxJsonRpcMessage<W::Role>>,
 }
 
 impl<W: Worker> WorkerContext<W> {
@@ -320,11 +361,37 @@ impl<W: Worker> WorkerContext<W> {
             .wrapping_add(1)
     }
 
-    pub async fn send_to_handler(
+    pub async fn send_to_handler<Resp>(
         &mut self,
-        item: RxJsonRpcMessage<W::Role>,
-    ) -> Result<(), WorkerQuitReason<W::Error>> {
-        self.to_handler_tx
+        item: crate::model::JsonRpcMessage<
+            <W::Role as ServiceRole>::PeerReq,
+            Resp,
+            <W::Role as ServiceRole>::PeerNot,
+        >,
+    ) -> Result<(), WorkerQuitReason<W::Error>>
+    where
+        Resp: serde::Serialize,
+    {
+        let item = match item {
+            crate::model::JsonRpcMessage::Request(request) => {
+                crate::model::JsonRpcMessage::Request(request)
+            }
+            crate::model::JsonRpcMessage::Response(response) => {
+                crate::model::JsonRpcMessage::Response(crate::model::JsonRpcResponse {
+                    jsonrpc: response.jsonrpc,
+                    id: response.id,
+                    result: serde_json::to_value(response.result)
+                        .map_err(WorkerQuitReason::ResponseSerialization)?,
+                })
+            }
+            crate::model::JsonRpcMessage::Notification(notification) => {
+                crate::model::JsonRpcMessage::Notification(notification)
+            }
+            crate::model::JsonRpcMessage::Error(error) => {
+                crate::model::JsonRpcMessage::Error(error)
+            }
+        };
+        self.raw_to_handler_tx
             .send(item)
             .await
             .map_err(|_| WorkerQuitReason::HandlerTerminated)
@@ -342,6 +409,10 @@ impl<W: Worker> WorkerContext<W> {
 
 impl<W: Worker> Transport<W::Role> for WorkerTransport<W> {
     type Error = W::Error;
+
+    fn preserves_raw_responses() -> bool {
+        W::preserves_raw_responses()
+    }
 
     fn send(
         &mut self,
@@ -397,6 +468,17 @@ impl<W: Worker> Transport<W::Role> for WorkerTransport<W> {
         }
     }
     async fn receive(&mut self) -> Option<RxJsonRpcMessage<W::Role>> {
+        loop {
+            let message = self.rx.recv().await?;
+            match decode_peer_response::<W::Role>(message) {
+                Ok(message) => return Some(message),
+                Err(error) => {
+                    tracing::debug!(%error, "Ignoring response with invalid result shape")
+                }
+            }
+        }
+    }
+    async fn receive_raw(&mut self) -> Option<RawRxJsonRpcMessage<W::Role>> {
         self.rx.recv().await
     }
     async fn close(&mut self) -> Result<(), Self::Error> {

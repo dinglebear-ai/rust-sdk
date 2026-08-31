@@ -27,7 +27,7 @@ use crate::{
         InitializedNotification, JsonObject, ProtocolVersion, RequestId, ServerJsonRpcMessage,
         ServerResult,
     },
-    service::InboundStreamOrigin,
+    service::{InboundStreamOrigin, RawRxJsonRpcMessage, decode_peer_response},
     transport::{
         common::{client_side_sse::SseAutoReconnectStream, mcp_headers},
         worker::{
@@ -253,6 +253,8 @@ pub enum StreamableHttpProtocolError {
 pub enum StreamableHttpPostResponse {
     Accepted,
     Json(ServerJsonRpcMessage, Option<String>),
+    /// A JSON response whose result body has not been decoded through the core union.
+    RawJson(RawRxJsonRpcMessage<RoleClient>, Option<String>),
     Sse(BoxedSseStream, Option<String>),
 }
 
@@ -261,6 +263,7 @@ impl std::fmt::Debug for StreamableHttpPostResponse {
         match self {
             Self::Accepted => write!(f, "Accepted"),
             Self::Json(arg0, arg1) => f.debug_tuple("Json").field(arg0).field(arg1).finish(),
+            Self::RawJson(arg0, arg1) => f.debug_tuple("RawJson").field(arg0).field(arg1).finish(),
             Self::Sse(_, arg1) => f.debug_tuple("Sse").field(arg1).finish(),
         }
     }
@@ -275,6 +278,9 @@ impl StreamableHttpPostResponse {
     {
         match self {
             Self::Json(message, session_id) => Ok((message, session_id)),
+            Self::RawJson(message, session_id) => {
+                Ok((decode_peer_response::<RoleClient>(message)?, session_id))
+            }
             Self::Sse(mut stream, session_id) => {
                 while let Some(event) = stream.next().await {
                     let event = event?;
@@ -283,7 +289,8 @@ impl StreamableHttpPostResponse {
                         continue;
                     }
 
-                    let message: ServerJsonRpcMessage = serde_json::from_str(&payload)?;
+                    let raw: RawRxJsonRpcMessage<RoleClient> = serde_json::from_str(&payload)?;
+                    let message = decode_peer_response::<RoleClient>(raw)?;
 
                     if matches!(message, ServerJsonRpcMessage::Response(_)) {
                         return Ok((message, session_id));
@@ -311,6 +318,7 @@ impl StreamableHttpPostResponse {
     {
         match self {
             Self::Json(message, ..) => Ok(message),
+            Self::RawJson(message, ..) => Ok(decode_peer_response::<RoleClient>(message)?),
             got => Err(StreamableHttpError::UnexpectedServerResponse(
                 format!("expect json, got {got:?}").into(),
             )),
@@ -325,6 +333,7 @@ impl StreamableHttpPostResponse {
             Self::Accepted => Ok(()),
             // Tolerate servers that return 200 with JSON for notifications
             Self::Json(..) => Ok(()),
+            Self::RawJson(..) => Ok(()),
             got => Err(StreamableHttpError::UnexpectedServerResponse(
                 format!("expect accepted or json, got {got:?}").into(),
             )),
@@ -381,6 +390,10 @@ pub(super) fn legacy_discover_response(
 /// handle the cancellation using state owned by that stream.
 pub trait StreamableHttpClient: Clone + Send + 'static {
     type Error: std::error::Error + Send + Sync + 'static;
+    /// Whether JSON responses are returned as [`StreamableHttpPostResponse::RawJson`].
+    fn preserves_raw_responses() -> bool {
+        false
+    }
     fn post_message(
         &self,
         uri: Arc<str>,
@@ -649,17 +662,27 @@ impl<C: StreamableHttpClient> StreamableHttpClientWorker<C> {
         }
     }
 
-    fn server_response_id(message: &ServerJsonRpcMessage) -> Option<&RequestId> {
+    fn server_response_id<Resp>(
+        message: &crate::model::JsonRpcMessage<
+            crate::model::ServerRequest,
+            Resp,
+            crate::model::ServerNotification,
+        >,
+    ) -> Option<&RequestId> {
         match message {
-            ServerJsonRpcMessage::Response(response) => Some(&response.id),
-            ServerJsonRpcMessage::Error(error) => error.id.as_ref(),
+            crate::model::JsonRpcMessage::Response(response) => Some(&response.id),
+            crate::model::JsonRpcMessage::Error(error) => error.id.as_ref(),
             _ => None,
         }
     }
 
-    fn clear_stream_response_pending(
+    fn clear_stream_response_pending<Resp>(
         pending_stream_response_ids: &mut HashSet<RequestId>,
-        message: &ServerJsonRpcMessage,
+        message: &crate::model::JsonRpcMessage<
+            crate::model::ServerRequest,
+            Resp,
+            crate::model::ServerNotification,
+        >,
     ) -> Option<RequestId> {
         let response_id = Self::server_response_id(message)?;
         if let Some(id) = pending_stream_response_ids.take(response_id) {
@@ -670,7 +693,7 @@ impl<C: StreamableHttpClient> StreamableHttpClientWorker<C> {
     }
 
     async fn drain_queued_stream_messages(
-        sse_worker_rx: &mut tokio::sync::mpsc::Receiver<ServerJsonRpcMessage>,
+        sse_worker_rx: &mut tokio::sync::mpsc::Receiver<RawRxJsonRpcMessage<RoleClient>>,
         context: &mut super::worker::WorkerContext<Self>,
         pending_stream_response_ids: &mut HashSet<RequestId>,
     ) -> Result<(), WorkerQuitReason<StreamableHttpError<C::Error>>> {
@@ -763,8 +786,9 @@ impl<C: StreamableHttpClient> StreamableHttpClientWorker<C> {
         custom_headers: HashMap<HeaderName, HeaderValue>,
         max_sse_event_size: usize,
         retry_config: Arc<dyn SseRetryPolicy>,
-    ) -> impl Stream<Item = Result<ServerJsonRpcMessage, StreamableHttpError<C::Error>>> + Send + 'static
-    {
+    ) -> impl Stream<Item = Result<RawRxJsonRpcMessage<RoleClient>, StreamableHttpError<C::Error>>>
+    + Send
+    + 'static {
         SseAutoReconnectStream::new_after_event_id(
             stream,
             StreamableHttpClientReconnect {
@@ -792,7 +816,8 @@ impl<C: StreamableHttpClient> StreamableHttpClientWorker<C> {
         custom_headers: HashMap<HeaderName, HeaderValue>,
         max_sse_event_size: usize,
         retry_config: Arc<dyn SseRetryPolicy>,
-    ) -> BoxStream<'static, Result<ServerJsonRpcMessage, StreamableHttpError<C::Error>>> {
+    ) -> BoxStream<'static, Result<RawRxJsonRpcMessage<RoleClient>, StreamableHttpError<C::Error>>>
+    {
         Self::reconnecting_sse_to_jsonrpc(
             stream,
             client,
@@ -809,9 +834,9 @@ impl<C: StreamableHttpClient> StreamableHttpClientWorker<C> {
     async fn run_response_stream(
         mut sse_stream: BoxStream<
             'static,
-            Result<ServerJsonRpcMessage, StreamableHttpError<C::Error>>,
+            Result<RawRxJsonRpcMessage<RoleClient>, StreamableHttpError<C::Error>>,
         >,
-        sse_worker_tx: tokio::sync::mpsc::Sender<ServerJsonRpcMessage>,
+        sse_worker_tx: tokio::sync::mpsc::Sender<RawRxJsonRpcMessage<RoleClient>>,
         origin: InboundStreamOrigin,
         request_ct: CancellationToken,
         stream_ct: CancellationToken,
@@ -831,10 +856,24 @@ impl<C: StreamableHttpClient> StreamableHttpClientWorker<C> {
         }
     }
 
-    async fn execute_sse_stream(
-        sse_stream: impl Stream<Item = Result<ServerJsonRpcMessage, StreamableHttpError<C::Error>>>
-        + Send,
-        sse_worker_tx: tokio::sync::mpsc::Sender<ServerJsonRpcMessage>,
+    async fn execute_sse_stream<Resp: Send + 'static>(
+        sse_stream: impl Stream<
+            Item = Result<
+                crate::model::JsonRpcMessage<
+                    crate::model::ServerRequest,
+                    Resp,
+                    crate::model::ServerNotification,
+                >,
+                StreamableHttpError<C::Error>,
+            >,
+        > + Send,
+        sse_worker_tx: tokio::sync::mpsc::Sender<
+            crate::model::JsonRpcMessage<
+                crate::model::ServerRequest,
+                Resp,
+                crate::model::ServerNotification,
+            >,
+        >,
         origin: InboundStreamOrigin,
         close_on_response: bool,
         ct: CancellationToken,
@@ -855,12 +894,12 @@ impl<C: StreamableHttpClient> StreamableHttpClientWorker<C> {
             };
             // SEP-2260: mark inbound requests with the stream they arrived on
             // for the client receive-side association check.
-            if let ServerJsonRpcMessage::Request(request) = &mut message {
+            if let crate::model::JsonRpcMessage::Request(request) = &mut message {
                 request.request.extensions_mut().insert(origin.clone());
             }
             let is_response = matches!(
                 message,
-                ServerJsonRpcMessage::Response(_) | ServerJsonRpcMessage::Error(_)
+                crate::model::JsonRpcMessage::Response(_) | crate::model::JsonRpcMessage::Error(_)
             );
             let yield_result = sse_worker_tx.send(message).await;
             if yield_result.is_err() {
@@ -887,7 +926,7 @@ impl<C: StreamableHttpClient> StreamableHttpClientWorker<C> {
         session_id: Arc<str>,
         config: &StreamableHttpClientTransportConfig,
         protocol_headers: HashMap<HeaderName, HeaderValue>,
-        sse_worker_tx: tokio::sync::mpsc::Sender<ServerJsonRpcMessage>,
+        sse_worker_tx: tokio::sync::mpsc::Sender<RawRxJsonRpcMessage<RoleClient>>,
         transport_task_ct: CancellationToken,
     ) {
         let uri = config.uri.clone();
@@ -1018,6 +1057,9 @@ impl<C: StreamableHttpClient> StreamableHttpClientWorker<C> {
 impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
     type Role = RoleClient;
     type Error = StreamableHttpError<C::Error>;
+    fn preserves_raw_responses() -> bool {
+        C::preserves_raw_responses()
+    }
     fn is_control_message(message: &ClientJsonRpcMessage) -> bool {
         match message {
             ClientJsonRpcMessage::Response(_) | ClientJsonRpcMessage::Error(_) => true,
@@ -1049,7 +1091,7 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
     ) -> Result<(), WorkerQuitReason<Self::Error>> {
         let channel_buffer_capacity = self.config.channel_buffer_capacity;
         let (sse_worker_tx, mut sse_worker_rx) =
-            tokio::sync::mpsc::channel::<ServerJsonRpcMessage>(channel_buffer_capacity);
+            tokio::sync::mpsc::channel::<RawRxJsonRpcMessage<RoleClient>>(channel_buffer_capacity);
         let config = self.config.clone();
         let transport_task_ct = context.cancellation_token.clone();
         let _drop_guard = transport_task_ct.clone().drop_guard();
@@ -1172,7 +1214,7 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
             StartPost(WorkerSendRequest<StreamableHttpClientWorker<C>>),
             PostResult(PostResult<C>),
             RecoveryTimeout,
-            ServerMessage(ServerJsonRpcMessage),
+            ServerMessage(RawRxJsonRpcMessage<RoleClient>),
             StreamResult {
                 request_id: Option<RequestId>,
                 result: Result<(), StreamableHttpError<C::Error>>,
@@ -1639,6 +1681,10 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
                             context.send_to_handler(message).await?;
                             Ok(())
                         }
+                        Ok(StreamableHttpPostResponse::RawJson(message, ..)) => {
+                            context.send_to_handler(message).await?;
+                            Ok(())
+                        }
                         Ok(StreamableHttpPostResponse::Sse(stream, ..)) => {
                             let stream_request_id = request_id;
                             let sse_stream = Self::response_sse_to_jsonrpc(
@@ -1710,7 +1756,7 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
                     }
                     let _ = responder.send(send_result);
                 }
-                Event::ServerMessage(mut json_rpc_message) => {
+                Event::ServerMessage(json_rpc_message) => {
                     // Match against all pending requests, not just open response streams.
                     if let Some(request_id) = Self::clear_stream_response_pending(
                         &mut pending_stream_response_ids,
@@ -1718,11 +1764,15 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
                     ) {
                         drop(request_stream_cancellations.remove(&request_id));
                     }
-                    cache_tools_from_response(
-                        &mut tool_header_cache,
-                        &mut json_rpc_message,
-                        &negotiated_version,
-                    );
+                    if let Ok(mut typed_message) =
+                        decode_peer_response::<RoleClient>(json_rpc_message.clone())
+                    {
+                        cache_tools_from_response(
+                            &mut tool_header_cache,
+                            &mut typed_message,
+                            &negotiated_version,
+                        );
+                    }
                     // send the message to the handler
                     if let Err(e) = context.send_to_handler(json_rpc_message).await {
                         break 'main_loop Err(e);
@@ -2299,7 +2349,7 @@ mod tests {
 
         let message = stream.next().await.expect("replayed response").unwrap();
 
-        assert!(matches!(message, ServerJsonRpcMessage::Response(_)));
+        assert!(matches!(message, crate::model::JsonRpcMessage::Response(_)));
         assert_eq!(
             reconnects.lock().expect("lock reconnects").as_slice(),
             &[(None, Some("event-0".into()))]
@@ -2417,7 +2467,8 @@ mod tests {
             &[(None, Some("e1".into()))],
             "the request must arrive on the resumed connection"
         );
-        let ServerJsonRpcMessage::Request(request) = rx.recv().await.expect("request forwarded")
+        let crate::model::JsonRpcMessage::Request(request) =
+            rx.recv().await.expect("request forwarded")
         else {
             panic!("expected request first");
         };
@@ -2428,7 +2479,7 @@ mod tests {
         );
         assert!(matches!(
             rx.recv().await.expect("response forwarded"),
-            ServerJsonRpcMessage::Response(_)
+            crate::model::JsonRpcMessage::Response(_)
         ));
     }
 
