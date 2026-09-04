@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- add `Peer::send_request_as` and option-aware typed request handles for
+  method-specific extension responses, plus an additive raw-response transport hook
+
 ## [3.1.4](https://github.com/modelcontextprotocol/rust-sdk/compare/rmcp-v3.1.3...rmcp-v3.1.4) - 2026-08-18
 
 ### Fixed
