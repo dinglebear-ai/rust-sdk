@@ -170,6 +170,66 @@ async fn typed_test_client() -> anyhow::Result<rmcp::service::RunningService<rmc
     Ok(().serve(client_transport).await?)
 }
 
+#[cfg(all(
+    feature = "auth",
+    feature = "transport-streamable-http-server",
+    feature = "transport-streamable-http-client-reqwest"
+))]
+#[tokio::test]
+async fn typed_skills_request_survives_oauth_http_wrapper() -> anyhow::Result<()> {
+    use rmcp::transport::{
+        auth::{AuthClient, AuthorizationManager},
+        streamable_http_client::{StreamableHttpClientTransportConfig, StreamableHttpClientWorker},
+        streamable_http_server::{
+            StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+        },
+    };
+    let stop = tokio_util::sync::CancellationToken::new();
+    let server: StreamableHttpService<TypedCustomRequestServer, LocalSessionManager> =
+        StreamableHttpService::new(
+            || Ok(TypedCustomRequestServer),
+            Default::default(),
+            StreamableHttpServerConfig::default().with_cancellation_token(stop.child_token()),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}/mcp", listener.local_addr()?);
+    let router = axum::Router::new().nest_service("/mcp", server);
+    let shutdown = stop.clone();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(shutdown.cancelled_owned())
+            .await
+    });
+    let result = tokio::time::timeout(Duration::from_secs(10), async {
+        let manager = AuthorizationManager::new(&endpoint).await?;
+        let auth = AuthClient::new(reqwest::Client::new(), manager);
+        let transport = StreamableHttpClientWorker::new(
+            auth,
+            StreamableHttpClientTransportConfig::with_uri(endpoint),
+        );
+        let client = ().serve(transport).await?;
+        let response = client
+            .send_request_as::<SkillsListResult>(ClientRequest::CustomRequest(CustomRequest::new(
+                "skills/list",
+                Some(json!({})),
+            )))
+            .await;
+        client.cancel().await?;
+        let response = response?;
+        assert_eq!(response.skills, ["example"]);
+        assert_eq!(
+            response.meta["io.modelcontextprotocol/serverInfo"]["name"],
+            "skills"
+        );
+        anyhow::Ok(())
+    })
+    .await;
+    stop.cancel();
+    tokio::time::timeout(Duration::from_secs(5), task).await???;
+    result??;
+    Ok(())
+}
+
 #[tokio::test]
 async fn typed_custom_request_bypasses_the_core_response_union() -> anyhow::Result<()> {
     let client = typed_test_client().await?;

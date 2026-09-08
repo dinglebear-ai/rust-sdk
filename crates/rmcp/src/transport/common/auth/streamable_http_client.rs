@@ -71,6 +71,10 @@ where
 {
     type Error = C::Error;
 
+    fn preserves_raw_responses() -> bool {
+        C::preserves_raw_responses()
+    }
+
     async fn delete_session(
         &self,
         uri: std::sync::Arc<str>,
