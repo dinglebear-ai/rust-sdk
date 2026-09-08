@@ -170,6 +170,217 @@ async fn typed_test_client() -> anyhow::Result<rmcp::service::RunningService<rmc
     Ok(().serve(client_transport).await?)
 }
 
+#[cfg(all(
+    feature = "auth",
+    feature = "transport-streamable-http-server",
+    feature = "transport-streamable-http-client-reqwest"
+))]
+#[tokio::test]
+async fn typed_skills_request_survives_oauth_http_wrapper() -> anyhow::Result<()> {
+    use rmcp::transport::{
+        auth::{AuthClient, AuthorizationManager},
+        streamable_http_client::{StreamableHttpClientTransportConfig, StreamableHttpClientWorker},
+        streamable_http_server::{
+            StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+        },
+    };
+    let stop = tokio_util::sync::CancellationToken::new();
+    let server: StreamableHttpService<TypedCustomRequestServer, LocalSessionManager> =
+        StreamableHttpService::new(
+            || Ok(TypedCustomRequestServer),
+            Default::default(),
+            StreamableHttpServerConfig::default().with_cancellation_token(stop.child_token()),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}/mcp", listener.local_addr()?);
+    let router = axum::Router::new().nest_service("/mcp", server);
+    let shutdown = stop.clone();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(shutdown.cancelled_owned())
+            .await
+    });
+    let result = tokio::time::timeout(Duration::from_secs(10), async {
+        let manager = AuthorizationManager::new(&endpoint).await?;
+        let auth = AuthClient::new(reqwest::Client::new(), manager);
+        let transport = StreamableHttpClientWorker::new(
+            auth,
+            StreamableHttpClientTransportConfig::with_uri(endpoint),
+        );
+        let client = ().serve(transport).await?;
+        let response = client
+            .send_request_as::<SkillsListResult>(ClientRequest::CustomRequest(CustomRequest::new(
+                "skills/list",
+                Some(json!({})),
+            )))
+            .await;
+        client.cancel().await?;
+        let response = response?;
+        assert_eq!(response.skills, ["example"]);
+        assert_eq!(
+            response.meta["io.modelcontextprotocol/serverInfo"]["name"],
+            "skills"
+        );
+        anyhow::Ok(())
+    })
+    .await;
+    stop.cancel();
+    tokio::time::timeout(Duration::from_secs(5), task).await???;
+    result??;
+    Ok(())
+}
+
+#[cfg(all(
+    feature = "auth",
+    feature = "transport-streamable-http-server",
+    feature = "transport-streamable-http-client-reqwest"
+))]
+#[tokio::test]
+async fn json_tool_listing_populates_parameter_headers_through_auth_client() -> anyhow::Result<()> {
+    use rmcp::{
+        ClientServiceExt,
+        model::{
+            CallToolRequestParams, CallToolResponse, CallToolResult, ListToolsResult,
+            PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+        },
+        service::RequestContext,
+        transport::{
+            auth::{AuthClient, AuthorizationManager},
+            streamable_http_client::{
+                StreamableHttpClientTransportConfig, StreamableHttpClientWorker,
+            },
+            streamable_http_server::{
+                StreamableHttpServerConfig, StreamableHttpService,
+                session::local::LocalSessionManager,
+            },
+        },
+    };
+
+    struct AnnotatedToolServer;
+    impl ServerHandler for AnnotatedToolServer {
+        fn supported_protocol_versions(
+            &self,
+        ) -> std::borrow::Cow<'static, [rmcp::model::ProtocolVersion]> {
+            std::borrow::Cow::Borrowed(&[rmcp::model::ProtocolVersion::V_2026_07_28])
+        }
+
+        fn get_info(&self) -> ServerInfo {
+            ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        }
+
+        fn get_tool(&self, name: &str) -> Option<Tool> {
+            (name == "deploy").then(|| {
+                Tool::new(
+                    "deploy",
+                    "Deploy in a region",
+                    Arc::new(
+                        json!({"type": "object", "properties": {
+                            "region": {"type": "string", "x-mcp-header": "Region"}
+                        }})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                    ),
+                )
+            })
+        }
+
+        async fn list_tools(
+            &self,
+            _: Option<PaginatedRequestParams>,
+            _: RequestContext<rmcp::RoleServer>,
+        ) -> Result<ListToolsResult, ErrorData> {
+            Ok(ListToolsResult::with_all_items(vec![
+                self.get_tool("deploy").unwrap(),
+            ]))
+        }
+
+        async fn call_tool(
+            &self,
+            _: CallToolRequestParams,
+            _: RequestContext<rmcp::RoleServer>,
+        ) -> Result<CallToolResponse, ErrorData> {
+            Ok(CallToolResult::success(vec![]).into())
+        }
+    }
+
+    let observed_headers = Arc::new(Mutex::new(Vec::new()));
+    let capture = observed_headers.clone();
+    let stop = tokio_util::sync::CancellationToken::new();
+    let server: StreamableHttpService<AnnotatedToolServer, LocalSessionManager> =
+        StreamableHttpService::new(
+            || Ok(AnnotatedToolServer),
+            Default::default(),
+            StreamableHttpServerConfig::default()
+                .with_legacy_session_mode(false)
+                .with_json_response(true)
+                .with_cancellation_token(stop.child_token()),
+        );
+    let router = axum::Router::new()
+        .nest_service("/mcp", server)
+        .layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let capture = capture.clone();
+                async move {
+                    if request
+                        .headers()
+                        .get("Mcp-Method")
+                        .is_some_and(|method| method == "tools/call")
+                    {
+                        capture
+                            .lock()
+                            .await
+                            .push(request.headers().get("Mcp-Param-Region").cloned());
+                    }
+                    next.run(request).await
+                }
+            },
+        ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}/mcp", listener.local_addr()?);
+    let shutdown = stop.clone();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(shutdown.cancelled_owned())
+            .await
+    });
+    let result = tokio::time::timeout(Duration::from_secs(10), async {
+        let manager = AuthorizationManager::new(&endpoint).await?;
+        let transport = StreamableHttpClientWorker::new(
+            AuthClient::new(reqwest::Client::new(), manager),
+            StreamableHttpClientTransportConfig::with_uri(endpoint),
+        );
+        let client = ()
+            .serve_with_lifecycle(
+                transport,
+                rmcp::service::ClientLifecycleMode::Discover {
+                    preferred_versions: vec![rmcp::model::ProtocolVersion::V_2026_07_28],
+                },
+            )
+            .await?;
+        let listed = client.list_tools(None).await?;
+        assert_eq!(listed.tools.len(), 1);
+        let response = client
+            .call_tool(
+                CallToolRequestParams::new("deploy")
+                    .with_arguments(json!({"region": "us-east-1"}).as_object().unwrap().clone()),
+            )
+            .await;
+        client.cancel().await?;
+        response?;
+        assert_eq!(
+            *observed_headers.lock().await,
+            vec![Some(http::HeaderValue::from_static("us-east-1"))]
+        );
+        anyhow::Ok(())
+    })
+    .await;
+    stop.cancel();
+    tokio::time::timeout(Duration::from_secs(5), task).await???;
+    result??;
+    Ok(())
+}
+
 #[tokio::test]
 async fn typed_custom_request_bypasses_the_core_response_union() -> anyhow::Result<()> {
     let client = typed_test_client().await?;

@@ -114,6 +114,36 @@ fn cache_tools_from_response(
     }
 }
 
+fn cache_tools_from_raw_response(
+    cache: &mut HashMap<String, Arc<JsonObject>>,
+    message: &mut RawRxJsonRpcMessage<RoleClient>,
+    protocol_version: &ProtocolVersion,
+) {
+    if protocol_version < &ProtocolVersion::STANDARD_HEADERS {
+        return;
+    }
+    if let crate::model::JsonRpcMessage::Response(response) = message
+        && let Some(tools) = response
+            .result
+            .get_mut("tools")
+            .and_then(serde_json::Value::as_array_mut)
+    {
+        tools.retain(|value| {
+            // Preserve the original JSON, including extension fields. Malformed
+            // tools remain for the normal response decoder to reject.
+            let Ok(tool) = serde_json::from_value::<crate::model::Tool>(value.clone()) else {
+                return true;
+            };
+            if let Err(reason) = mcp_headers::validate_param_header_annotations(&tool.input_schema) {
+                tracing::warn!(tool = %tool.name, "rejecting invalid x-mcp-header annotations: {reason}");
+                return false;
+            }
+            cache.insert(tool.name.to_string(), tool.input_schema);
+            true
+        });
+    }
+}
+
 fn negotiate_version_headers(
     init_response: &ServerJsonRpcMessage,
     base: HashMap<HeaderName, HeaderValue>,
@@ -245,7 +275,7 @@ pub enum StreamableHttpProtocolError {
     MissingSessionIdInResponse,
 }
 
-#[expect(
+#[allow(
     clippy::large_enum_variant,
     reason = "boxing the streaming response would add an allocation to the common response path"
 )]
@@ -1681,8 +1711,17 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
                             context.send_to_handler(message).await?;
                             Ok(())
                         }
-                        Ok(StreamableHttpPostResponse::RawJson(message, ..)) => {
-                            context.send_to_handler(message).await?;
+                        Ok(StreamableHttpPostResponse::RawJson(mut raw_message, ..)) => {
+                            if matches!(&message, ClientJsonRpcMessage::Request(request)
+                                if matches!(&request.request, ClientRequest::ListToolsRequest(_)))
+                            {
+                                cache_tools_from_raw_response(
+                                    &mut tool_header_cache,
+                                    &mut raw_message,
+                                    &version,
+                                );
+                            }
+                            context.send_to_handler(raw_message).await?;
                             Ok(())
                         }
                         Ok(StreamableHttpPostResponse::Sse(stream, ..)) => {
@@ -2532,6 +2571,36 @@ mod tests {
     }
 
     #[test]
+    fn raw_tool_cache_preserves_extensions_and_filters_invalid_annotations() {
+        let mut valid = serde_json::to_value(tool(
+            "valid",
+            json!({"type": "string", "x-mcp-header": "Value"}),
+        ))
+        .unwrap();
+        valid["vendorExtension"] = json!({"retained": true});
+        let invalid = serde_json::to_value(tool(
+            "invalid",
+            json!({"type": "string", "x-mcp-header": ""}),
+        ))
+        .unwrap();
+        let mut message = RawRxJsonRpcMessage::<RoleClient>::response(
+            json!({"tools": [valid.clone(), invalid], "vendorResult": 42}),
+            NumberOrString::Number(1),
+        );
+        let mut cache = HashMap::new();
+        cache_tools_from_raw_response(&mut cache, &mut message, &ProtocolVersion::V_2026_07_28);
+        assert!(cache.contains_key("valid"));
+        assert!(!cache.contains_key("invalid"));
+        let crate::model::JsonRpcMessage::Response(response) = message else {
+            panic!("response")
+        };
+        assert_eq!(
+            response.result,
+            json!({"tools": [valid], "vendorResult": 42})
+        );
+    }
+
+    #[test]
     fn cache_tools_preserves_pre_standard_header_results() {
         let invalid = tool("legacy", json!({ "type": "string", "x-mcp-header": "" }));
         let mut message = ServerJsonRpcMessage::response(
@@ -2555,6 +2624,34 @@ mod tests {
                 .map(|tool| tool.name.as_ref())
                 .collect::<Vec<_>>(),
             vec!["legacy"]
+        );
+    }
+
+    #[test]
+    fn raw_tool_cache_preserves_legacy_results_and_malformed_tools() {
+        let malformed = json!({"name": "broken", "inputSchema": "not-an-object"});
+        let invalid = serde_json::to_value(tool("legacy", json!({"x-mcp-header": ""}))).unwrap();
+        let original = json!({"tools": [invalid, malformed.clone()], "vendorResult": 42});
+        let mut message = RawRxJsonRpcMessage::<RoleClient>::response(
+            original.clone(),
+            NumberOrString::Number(1),
+        );
+        let mut cache = HashMap::new();
+        cache_tools_from_raw_response(&mut cache, &mut message, &ProtocolVersion::V_2025_11_25);
+        assert!(cache.is_empty());
+        let crate::model::JsonRpcMessage::Response(response) = &message else {
+            panic!("response")
+        };
+        assert_eq!(response.result, original);
+
+        cache_tools_from_raw_response(&mut cache, &mut message, &ProtocolVersion::V_2026_07_28);
+        assert!(cache.is_empty());
+        let crate::model::JsonRpcMessage::Response(response) = message else {
+            panic!("response")
+        };
+        assert_eq!(
+            response.result,
+            json!({"tools": [malformed], "vendorResult": 42})
         );
     }
 
