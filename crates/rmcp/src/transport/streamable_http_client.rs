@@ -275,7 +275,7 @@ pub enum StreamableHttpProtocolError {
     MissingSessionIdInResponse,
 }
 
-#[expect(
+#[allow(
     clippy::large_enum_variant,
     reason = "boxing the streaming response would add an allocation to the common response path"
 )]
@@ -2624,6 +2624,34 @@ mod tests {
                 .map(|tool| tool.name.as_ref())
                 .collect::<Vec<_>>(),
             vec!["legacy"]
+        );
+    }
+
+    #[test]
+    fn raw_tool_cache_preserves_legacy_results_and_malformed_tools() {
+        let malformed = json!({"name": "broken", "inputSchema": "not-an-object"});
+        let invalid = serde_json::to_value(tool("legacy", json!({"x-mcp-header": ""}))).unwrap();
+        let original = json!({"tools": [invalid, malformed.clone()], "vendorResult": 42});
+        let mut message = RawRxJsonRpcMessage::<RoleClient>::response(
+            original.clone(),
+            NumberOrString::Number(1),
+        );
+        let mut cache = HashMap::new();
+        cache_tools_from_raw_response(&mut cache, &mut message, &ProtocolVersion::V_2025_11_25);
+        assert!(cache.is_empty());
+        let crate::model::JsonRpcMessage::Response(response) = &message else {
+            panic!("response")
+        };
+        assert_eq!(response.result, original);
+
+        cache_tools_from_raw_response(&mut cache, &mut message, &ProtocolVersion::V_2026_07_28);
+        assert!(cache.is_empty());
+        let crate::model::JsonRpcMessage::Response(response) = message else {
+            panic!("response")
+        };
+        assert_eq!(
+            response.result,
+            json!({"tools": [malformed], "vendorResult": 42})
         );
     }
 
