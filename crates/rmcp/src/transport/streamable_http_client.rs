@@ -422,6 +422,15 @@ pub trait StreamableHttpClient: Clone + Send + 'static {
     type Error: std::error::Error + Send + Sync + 'static;
 
     /// Whether this backend preserves response result bodies as raw JSON.
+    ///
+    /// Returning `true` is a contract that all JSON responses use
+    /// [`StreamableHttpPostResponse::RawJson`] and that every SSE response path
+    /// yields events whose JSON-RPC result has not first been decoded through
+    /// [`ServerResult`]. Backends that cannot satisfy both requirements must
+    /// retain the default `false`; typed requests then fail before being sent.
+    /// The built-in reqwest and Unix-socket backends satisfy this contract.
+    /// The authenticated HTTP wrapper forwards the wrapped backend's
+    /// capability.
     fn preserves_raw_responses() -> bool {
         false
     }

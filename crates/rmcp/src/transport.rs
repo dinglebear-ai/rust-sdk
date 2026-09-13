@@ -147,19 +147,32 @@ where
 
     /// Whether this transport preserves response result bodies as raw JSON.
     ///
-    /// Typed extension requests require this capability. Existing transports
-    /// default to `false` because decoding into the role response union can
-    /// irreversibly discard extension fields.
+    /// Typed extension requests require this capability. Returning `true` is a
+    /// contract that [`Self::receive_raw`] returns the original JSON result for
+    /// every response path without first decoding it through the role response
+    /// union. A transport that cannot satisfy that contract must retain the
+    /// default `false`; typed requests then fail with
+    /// [`crate::service::ServiceError::RawResponseUnavailable`] before they are
+    /// sent.
+    ///
+    /// The built-in async-read/write, child-process, reqwest HTTP, Unix-socket
+    /// HTTP transports preserve raw responses. Authenticated HTTP wrappers
+    /// forward the wrapped backend's capability, and a `WorkerTransport`
+    /// forwards the capability declared by its worker.
+    /// Existing custom transports default to `false` for source and behavior
+    /// compatibility.
     fn preserves_raw_responses() -> bool {
         false
     }
 
     /// Receive a message while preserving the raw JSON-RPC result value.
     ///
-    /// Transports should override this method when they can retain the raw
-    /// response body. The default preserves compatibility for existing custom
-    /// transports, but an extension result already decoded through the role's
-    /// response union cannot recover information discarded by that union.
+    /// A transport that returns `true` from [`Self::preserves_raw_responses`]
+    /// must override this method and retain raw results on every response path.
+    /// The default adapts the existing typed receive API for custom transports;
+    /// it does not make typed extension requests available because an extension
+    /// result already decoded through the role response union cannot recover
+    /// information discarded by that union.
     fn receive_raw(&mut self) -> impl Future<Output = Option<RawRxJsonRpcMessage<R>>> + Send {
         async move {
             self.receive().await.map(|message| match message {

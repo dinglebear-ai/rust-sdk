@@ -281,6 +281,12 @@ pub type RxJsonRpcMessage<R> = JsonRpcMessage<
     <R as ServiceRole>::PeerResp,
     <R as ServiceRole>::PeerNot,
 >;
+/// A received JSON-RPC message whose response result remains raw JSON.
+///
+/// Requests and notifications retain the peer types defined by `R`; only a
+/// successful response's result is represented as [`serde_json::Value`]. This
+/// prevents extension fields from being lost to the role's core response union
+/// before a typed request can deserialize them.
 pub type RawRxJsonRpcMessage<R> =
     JsonRpcMessage<<R as ServiceRole>::PeerReq, serde_json::Value, <R as ServiceRole>::PeerNot>;
 
@@ -465,7 +471,7 @@ impl<R: ServiceRole, S: Service<R>> DynService<R> for S {
 }
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     ops::Deref,
     sync::{Arc, atomic::AtomicU64},
     time::Duration,
@@ -549,11 +555,12 @@ type ProgressTimeoutWatchers = Arc<tokio::sync::RwLock<HashMap<ProgressToken, mp
 type SubscriptionChannel<N> = (mpsc::Sender<N>, usize);
 type SubscriptionChannelMap<N> = HashMap<RequestId, SubscriptionChannel<N>>;
 
-/// A handle to a remote request
+/// A handle to a remote request whose response resolves to `T`.
 ///
-/// You can cancel it by call [`RequestHandle::cancel`] with a reason,
-///
-/// or wait for response by call [`RequestHandle::await_response`]
+/// `T` defaults to the role's core peer-response union. Typed extension
+/// requests created by [`Peer::send_request_as_with_option`] instead use the
+/// caller's concrete result type. Call [`RequestHandle::cancel`] to cancel the
+/// request with a reason, or [`RequestHandle::await_response`] to await it.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct RequestHandle<R: ServiceRole, T = <R as ServiceRole>::PeerResp> {
@@ -753,6 +760,15 @@ impl<R: ServiceRole> PendingResponder<R> {
             Self::Typed(responder) => responder(Ok(value)),
         }
     }
+
+    fn send_standard_result(self, value: R::PeerResp) {
+        match self {
+            Self::Standard(responder) => {
+                let _ = responder.send(Ok(value));
+            }
+            Self::Typed(responder) => responder(Err(ServiceError::RawResponseUnavailable)),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -914,6 +930,14 @@ impl<R: ServiceRole> Peer<R> {
     /// concrete type avoids ambiguous `#[serde(untagged)]` union matching.
     /// The caller is responsible for pairing the request method with its
     /// correct result type.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError::RawResponseUnavailable`] without sending the
+    /// request when the selected transport cannot preserve raw result JSON.
+    /// Returns [`ServiceError::ResponseDeserialization`] when the received
+    /// result does not deserialize as `T`. Transport, peer, timeout, and
+    /// cancellation errors are returned unchanged.
     pub async fn send_request_as<T>(&self, request: R::Req) -> Result<T, ServiceError>
     where
         T: serde::de::DeserializeOwned + Send + 'static,
@@ -926,6 +950,9 @@ impl<R: ServiceRole> Peer<R> {
 
     /// Send a typed request with the same timeout, metadata, progress, and
     /// cancellation lifecycle available to core requests.
+    ///
+    /// Raw-response support and error behavior are the same as
+    /// [`Peer::send_request_as`].
     pub async fn send_request_as_with_option<T>(
         &self,
         request: R::Req,
@@ -1468,7 +1495,6 @@ where
     let current_span = tracing::Span::current();
     let handle = spawn_service_task(async move {
         let mut transport = transport.into_transport();
-        let mut batch_messages = VecDeque::<RawRxJsonRpcMessage<R>>::new();
         let mut send_task_set = tokio::task::JoinSet::<SendTaskResult>::new();
         let mut response_send_tasks = tokio::task::JoinSet::<()>::new();
         #[derive(Debug)]
@@ -1487,16 +1513,14 @@ where
         enum Event<R: ServiceRole> {
             ProxyMessage(PeerSinkMessage<R>),
             PeerMessage(RawRxJsonRpcMessage<R>),
+            LegacyPeerMessage(RxJsonRpcMessage<R>),
             ToSink(TxJsonRpcMessage<R>),
             SendTaskResult(SendTaskResult),
             ResponseSendTaskResult(Result<(), tokio::task::JoinError>),
         }
 
         let quit_reason = loop {
-            let evt = if let Some(m) = batch_messages.pop_front() {
-                Event::PeerMessage(m)
-            } else {
-                tokio::select! {
+            let evt = tokio::select! {
                     m = sink_proxy_rx.recv(), if !sink_proxy_rx.is_closed() => {
                         if let Some(m) = m {
                             Event::ToSink(m)
@@ -1504,9 +1528,15 @@ where
                             continue
                         }
                     }
-                    m = transport.receive_raw() => {
-                        if let Some(m) = m {
-                            Event::PeerMessage(m)
+                    m = async {
+                        if T::preserves_raw_responses() {
+                            transport.receive_raw().await.map(Event::PeerMessage)
+                        } else {
+                            transport.receive().await.map(Event::LegacyPeerMessage)
+                        }
+                    } => {
+                        if let Some(event) = m {
+                            event
                         } else {
                             // input stream closed
                             tracing::info!("input stream terminated");
@@ -1544,7 +1574,31 @@ where
                         tracing::info!("task cancelled");
                         break QuitReason::Cancelled
                     }
+                };
+
+            let evt = match evt {
+                Event::LegacyPeerMessage(JsonRpcMessage::Response(JsonRpcResponse {
+                    result,
+                    id,
+                    ..
+                })) => {
+                    if let Some(responder) =
+                        remove_pending_request(&mut local_responder_pool, &id)
+                    {
+                        responder.send_standard_result(result);
+                    }
+                    continue;
                 }
+                Event::LegacyPeerMessage(JsonRpcMessage::Request(request)) => {
+                    Event::PeerMessage(JsonRpcMessage::Request(request))
+                }
+                Event::LegacyPeerMessage(JsonRpcMessage::Notification(notification)) => {
+                    Event::PeerMessage(JsonRpcMessage::Notification(notification))
+                }
+                Event::LegacyPeerMessage(JsonRpcMessage::Error(error)) => {
+                    Event::PeerMessage(JsonRpcMessage::Error(error))
+                }
+                event => event,
             };
 
             tracing::trace!(?evt, "new event");
@@ -1825,6 +1879,7 @@ where
                         responder.send_error(service_error);
                     }
                 }
+                Event::LegacyPeerMessage(_) => unreachable!("legacy messages are normalized above"),
             }
         };
 

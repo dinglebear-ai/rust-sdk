@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- add typed custom-response requests that preserve extension result fields across supported built-in transports
+
+### Fixed
+
+- reject malformed, duplicate, non-UTF-8, and disallowed HTTP Origin headers consistently
+- compare HTTP origins using normalized effective ports instead of treating an omitted configured port as a wildcard
+
 ## [3.3.0](https://github.com/modelcontextprotocol/rust-sdk/compare/rmcp-v3.2.0...rmcp-v3.3.0) - 2026-09-10
 
 ### Added

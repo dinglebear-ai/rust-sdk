@@ -1,5 +1,12 @@
 #![cfg(not(feature = "local"))]
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use rmcp::{
     ClientHandler, RoleClient, ServerHandler, ServiceExt,
@@ -7,7 +14,7 @@ use rmcp::{
         ClientRequest, ClientResult, CustomRequest, CustomResult, ErrorCode, ErrorData,
         PingRequest, ServerRequest, ServerResult,
     },
-    service::{PeerRequestOptions, ServiceError},
+    service::{PeerRequestOptions, ServiceError, serve_directly},
     transport::Transport,
 };
 use serde::Deserialize;
@@ -42,6 +49,83 @@ impl Transport<RoleClient> for LegacyTypedTransport {
 async fn existing_transport_implementations_get_the_raw_receive_compatibility_default() {
     let mut transport = LegacyTypedTransport;
     assert!(transport.receive_raw().await.is_none());
+}
+
+struct LegacyResponseTransport {
+    responses: tokio::sync::mpsc::UnboundedReceiver<rmcp::model::ServerJsonRpcMessage>,
+    response_tx: tokio::sync::mpsc::UnboundedSender<rmcp::model::ServerJsonRpcMessage>,
+    sends: Arc<AtomicUsize>,
+}
+
+impl Transport<RoleClient> for LegacyResponseTransport {
+    type Error = std::convert::Infallible;
+
+    fn send(
+        &mut self,
+        item: rmcp::service::TxJsonRpcMessage<RoleClient>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
+        let response_tx = self.response_tx.clone();
+        let sends = self.sends.clone();
+        async move {
+            if let rmcp::model::ClientJsonRpcMessage::Request(request) = item {
+                sends.fetch_add(1, Ordering::SeqCst);
+                let _ = response_tx.send(rmcp::model::ServerJsonRpcMessage::response(
+                    ServerResult::CustomResult(CustomResult::new(json!({}))),
+                    request.id,
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    async fn receive(&mut self) -> Option<rmcp::service::RxJsonRpcMessage<RoleClient>> {
+        self.responses.recv().await
+    }
+
+    fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        std::future::ready(Ok(()))
+    }
+}
+
+#[tokio::test]
+async fn legacy_transport_preserves_standard_response_without_raw_round_trip() -> anyhow::Result<()>
+{
+    let (response_tx, responses) = tokio::sync::mpsc::unbounded_channel();
+    let sends = Arc::new(AtomicUsize::new(0));
+    let transport = LegacyResponseTransport {
+        responses,
+        response_tx,
+        sends: sends.clone(),
+    };
+    let client = serve_directly::<RoleClient, _, _, _, _>(
+        (),
+        transport,
+        Some(rmcp::model::ServerInfo::default().into()),
+    );
+
+    let typed = client
+        .send_request_as::<SkillsListResult>(ClientRequest::CustomRequest(CustomRequest::new(
+            "skills/list",
+            None,
+        )))
+        .await;
+    assert!(matches!(typed, Err(ServiceError::RawResponseUnavailable)));
+    assert_eq!(sends.load(Ordering::SeqCst), 0, "typed request was sent");
+
+    let standard = client
+        .send_request(ClientRequest::CustomRequest(CustomRequest::new(
+            "requests/custom-test",
+            None,
+        )))
+        .await?;
+    assert!(matches!(
+        standard,
+        ServerResult::CustomResult(result) if result.0 == json!({})
+    ));
+    assert_eq!(sends.load(Ordering::SeqCst), 1);
+
+    client.cancel().await?;
+    Ok(())
 }
 
 struct CustomRequestServer {
@@ -460,6 +544,73 @@ async fn typed_custom_requests_use_standard_timeout_and_cancellation() -> anyhow
     assert_eq!(recovered.skills, ["example"]);
 
     client.cancel().await?;
+    Ok(())
+}
+
+struct CancellationObservingServer {
+    started: Arc<Notify>,
+    cancelled: Arc<Notify>,
+}
+
+impl ServerHandler for CancellationObservingServer {
+    async fn on_custom_request(
+        &self,
+        request: CustomRequest,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CustomResult, rmcp::ErrorData> {
+        if request.method == "skills/list" {
+            return Ok(CustomResult::new(json!({
+                "resultType": "complete",
+                "skills": ["after-cancellation"],
+                "_meta": {}
+            })));
+        }
+        self.started.notify_one();
+        context.ct.cancelled().await;
+        self.cancelled.notify_one();
+        Ok(CustomResult::new(json!({"cancelled": true})))
+    }
+}
+
+#[tokio::test]
+async fn typed_custom_request_handle_sends_cancellation_to_the_peer() -> anyhow::Result<()> {
+    let started = Arc::new(Notify::new());
+    let cancelled = Arc::new(Notify::new());
+    let (server_transport, client_transport) = tokio::io::duplex(4096);
+    let server_task = tokio::spawn({
+        let started = started.clone();
+        let cancelled = cancelled.clone();
+        async move {
+            CancellationObservingServer { started, cancelled }
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            anyhow::Ok(())
+        }
+    });
+    let client = ().serve(client_transport).await?;
+    let handle = client
+        .send_request_as_with_option::<serde_json::Value>(
+            ClientRequest::CustomRequest(CustomRequest::new("skills/cancel", None)),
+            PeerRequestOptions::no_options(),
+        )
+        .await?;
+
+    tokio::time::timeout(Duration::from_secs(2), started.notified()).await?;
+    handle.cancel(Some("test cancellation".into())).await?;
+    tokio::time::timeout(Duration::from_secs(2), cancelled.notified()).await?;
+
+    let following: SkillsListResult = client
+        .send_request_as(ClientRequest::CustomRequest(CustomRequest::new(
+            "skills/list",
+            None,
+        )))
+        .await?;
+    assert_eq!(following.skills, ["after-cancellation"]);
+
+    client.cancel().await?;
+    tokio::time::timeout(Duration::from_secs(2), server_task).await???;
     Ok(())
 }
 

@@ -1124,7 +1124,10 @@ async fn test_server_falls_back_to_uri_authority_when_host_header_missing() {
 
 #[cfg(all(feature = "transport-streamable-http-server", feature = "server"))]
 mod origin_validation {
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use bytes::Bytes;
     use http::{Method, Request, header::CONTENT_TYPE};
@@ -1150,8 +1153,18 @@ mod origin_validation {
     fn service_with_allowed_origins(
         origins: &[&str],
     ) -> StreamableHttpService<TestHandler, LocalSessionManager> {
+        service_with_allowed_origins_and_counter(origins, Arc::new(AtomicUsize::new(0)))
+    }
+
+    fn service_with_allowed_origins_and_counter(
+        origins: &[&str],
+        handler_creations: Arc<AtomicUsize>,
+    ) -> StreamableHttpService<TestHandler, LocalSessionManager> {
         StreamableHttpService::new(
-            || Ok(TestHandler),
+            move || {
+                handler_creations.fetch_add(1, Ordering::SeqCst);
+                Ok(TestHandler)
+            },
             Arc::new(LocalSessionManager::default()),
             StreamableHttpServerConfig::default().with_allowed_origins(origins.iter().copied()),
         )
@@ -1204,6 +1217,25 @@ mod origin_validation {
         let service = service_with_allowed_origins(&["http://localhost:8080"]);
         let response = service.handle(init_request(Some("not an origin"))).await;
         assert_eq!(response.status(), http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn non_utf8_origin_is_forbidden_before_handler_creation() {
+        let handler_creations = Arc::new(AtomicUsize::new(0));
+        let service = service_with_allowed_origins_and_counter(
+            &["http://localhost:8080"],
+            handler_creations.clone(),
+        );
+        let mut request = init_request(None);
+        request.headers_mut().insert(
+            http::header::ORIGIN,
+            http::HeaderValue::from_bytes(b"\xff").expect("opaque header value"),
+        );
+
+        let response = service.handle(request).await;
+
+        assert_eq!(response.status(), http::StatusCode::FORBIDDEN);
+        assert_eq!(handler_creations.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
