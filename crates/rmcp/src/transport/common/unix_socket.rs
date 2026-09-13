@@ -10,7 +10,7 @@ use sse_stream::Sse;
 use tokio::net::UnixStream;
 
 use crate::{
-    model::{ClientJsonRpcMessage, ServerJsonRpcMessage},
+    model::ClientJsonRpcMessage,
     transport::{
         common::{
             client_side_sse::{DEFAULT_MAX_SSE_EVENT_SIZE, bounded_sse_stream},
@@ -163,6 +163,10 @@ fn apply_custom_headers(
 
 impl StreamableHttpClient for UnixSocketHttpClient {
     type Error = UnixSocketError;
+
+    fn preserves_raw_responses() -> bool {
+        true
+    }
 
     async fn post_message(
         &self,
@@ -321,8 +325,10 @@ impl StreamableHttpClient for UnixSocketHttpClient {
                     .await
                     .map_err(|e| StreamableHttpError::Client(UnixSocketError::Hyper(e)))?
                     .to_bytes();
-                match serde_json::from_slice::<ServerJsonRpcMessage>(&body) {
-                    Ok(message) => Ok(StreamableHttpPostResponse::Json(message, session_id)),
+                match serde_json::from_slice::<crate::service::RawRxJsonRpcMessage<crate::RoleClient>>(
+                    &body,
+                ) {
+                    Ok(message) => Ok(StreamableHttpPostResponse::RawJson(message, session_id)),
                     Err(e) => {
                         tracing::warn!(
                             "could not parse JSON response as ServerJsonRpcMessage, treating as accepted: {e}"

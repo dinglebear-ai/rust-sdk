@@ -40,6 +40,8 @@ use crate::{
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum ClientInitializeError {
+    #[error("failed to deserialize initialization response: {0}")]
+    ResponseDeserialization(#[source] serde_json::Error),
     #[error("expect initialized response, but received: {0:?}")]
     ExpectedInitResponse(Option<ServerJsonRpcMessage>),
 
@@ -152,10 +154,12 @@ async fn expect_next_message<T>(
 where
     T: Transport<RoleClient>,
 {
-    transport
-        .receive()
+    let message = transport
+        .receive_raw()
         .await
-        .ok_or_else(|| ClientInitializeError::ConnectionClosed(context.to_string()))
+        .ok_or_else(|| ClientInitializeError::ConnectionClosed(context.to_string()))?;
+    super::decode_peer_response::<RoleClient>(message)
+        .map_err(ClientInitializeError::ResponseDeserialization)
 }
 
 /// Helper function to expect a response from the stream, correlated to

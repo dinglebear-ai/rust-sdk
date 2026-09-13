@@ -1200,6 +1200,61 @@ mod origin_validation {
     }
 
     #[tokio::test]
+    async fn malformed_origin_is_forbidden() {
+        let service = service_with_allowed_origins(&["http://localhost:8080"]);
+        let response = service.handle(init_request(Some("not an origin"))).await;
+        assert_eq!(response.status(), http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn multiple_origin_headers_are_forbidden() {
+        let service = service_with_allowed_origins(&["http://localhost:8080"]);
+        let mut request = init_request(Some("http://localhost:8080"));
+        request.headers_mut().append(
+            http::header::ORIGIN,
+            "http://attacker.example".parse().unwrap(),
+        );
+        let response = service.handle(request).await;
+        assert_eq!(response.status(), http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn allowlisted_origin_does_not_wildcard_an_unexpected_port() {
+        let service = service_with_allowed_origins(&["https://app.example"]);
+        let response = service
+            .handle(init_request(Some("https://app.example:9443")))
+            .await;
+        assert_eq!(response.status(), http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn default_origin_ports_are_equivalent() {
+        for (allowed, presented) in [
+            ("http://localhost", "http://localhost:80"),
+            ("https://localhost:443", "https://localhost"),
+        ] {
+            let service = service_with_allowed_origins(&[allowed]);
+            let response = service.handle(init_request(Some(presented))).await;
+            assert_eq!(response.status(), http::StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn origin_with_non_origin_components_is_forbidden() {
+        for origin in [
+            "http://localhost:8080/",
+            "http://localhost:8080/evil",
+            "http://localhost:8080?query=1",
+            "http://user@localhost:8080",
+            "http://localhost:8080#fragment",
+        ] {
+            let service = service_with_allowed_origins(&["http://localhost:8080"]);
+            let response = service.handle(init_request(Some(origin))).await;
+            assert_eq!(response.status(), http::StatusCode::FORBIDDEN, "{origin}");
+        }
+    }
+
+    #[tokio::test]
     async fn missing_origin_passes_through() {
         let service = service_with_allowed_origins(&["http://localhost:8080"]);
         let response = service.handle(init_request(None)).await;

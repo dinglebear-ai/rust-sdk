@@ -791,13 +791,22 @@ fn parse_origin_value(value: &str) -> Option<NormalizedOrigin> {
     if value.eq_ignore_ascii_case("null") {
         return Some(NormalizedOrigin::Null);
     }
+    let (_, serialized_authority) = value.split_once("://")?;
+    if serialized_authority.contains(['/', '?', '#', '@']) {
+        return None;
+    }
     let uri = http::Uri::try_from(value).ok()?;
     let scheme = uri.scheme_str()?.to_ascii_lowercase();
     let authority = uri.authority()?;
+    let port = authority.port_u16().or(match scheme.as_str() {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    });
     Some(NormalizedOrigin::Tuple {
         scheme,
         host: normalize_host(authority.host()),
-        port: authority.port_u16(),
+        port,
     })
 }
 
@@ -821,7 +830,7 @@ fn origin_is_allowed(origin: &NormalizedOrigin, allowed_origins: &[String]) -> b
                     host: o_host,
                     port: o_port,
                 },
-            ) => a_scheme == o_scheme && a_host == o_host && (a_port.is_none() || a_port == o_port),
+            ) => a_scheme == o_scheme && a_host == o_host && a_port == o_port,
             _ => false,
         })
 }
@@ -884,21 +893,26 @@ fn validate_origin_header(headers: &HeaderMap, allowed_origins: &[String]) -> Ht
     if allowed_origins.is_empty() {
         return Ok(());
     }
-    let Some(origin_header) = headers.get(http::header::ORIGIN) else {
+    let mut origin_headers = headers.get_all(http::header::ORIGIN).iter();
+    let Some(origin_header) = origin_headers.next() else {
         return Ok(());
     };
+    if origin_headers.next().is_some() {
+        tracing::warn!("rejected request with multiple Origin headers");
+        return Err(forbidden_response("Forbidden: Multiple Origin headers").into());
+    }
     let origin_str = origin_header
         .to_str()
         .inspect_err(|_| {
             tracing::warn!(origin = ?origin_header, "rejected request with non-UTF-8 Origin header");
         })
-        .map_err(|_| bad_request_response("Bad Request: Invalid Origin header encoding"))?;
+        .map_err(|_| forbidden_response("Forbidden: Invalid Origin header encoding"))?;
     let origin = parse_origin_value(origin_str).ok_or_else(|| {
         tracing::warn!(
             origin = origin_str,
             "rejected request with malformed Origin header",
         );
-        bad_request_response("Bad Request: Invalid Origin header")
+        forbidden_response("Forbidden: Invalid Origin header")
     })?;
     if !origin_is_allowed(&origin, allowed_origins) {
         tracing::warn!(

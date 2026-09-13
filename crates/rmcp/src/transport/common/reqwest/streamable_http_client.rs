@@ -49,6 +49,10 @@ fn parse_json_rpc_error(body: &str) -> Option<ServerJsonRpcMessage> {
 impl StreamableHttpClient for reqwest::Client {
     type Error = reqwest::Error;
 
+    fn preserves_raw_responses() -> bool {
+        true
+    }
+
     async fn get_stream(
         &self,
         uri: Arc<str>,
@@ -311,8 +315,11 @@ impl StreamableHttpClient for reqwest::Client {
                 // Try to parse as a valid JSON-RPC message. If the body is
                 // malformed (e.g. a 200 response to a notification that lacks
                 // an `id` field), treat it as accepted rather than failing.
-                match response.json::<ServerJsonRpcMessage>().await {
-                    Ok(message) => Ok(StreamableHttpPostResponse::Json(message, session_id)),
+                match response
+                    .json::<crate::service::RawRxJsonRpcMessage<crate::RoleClient>>()
+                    .await
+                {
+                    Ok(message) => Ok(StreamableHttpPostResponse::RawJson(message, session_id)),
                     Err(e) => {
                         tracing::warn!(
                             "could not parse JSON response as ServerJsonRpcMessage, treating as accepted: {e}"
