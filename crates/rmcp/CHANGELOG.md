@@ -9,7 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- add typed custom-response requests that preserve extension result fields across supported built-in transports
+- add `Peer::send_request_as` and option-aware typed request handles that
+  preserve method-specific extension response fields across supported built-in
+  transports
 
 ### Fixed
 

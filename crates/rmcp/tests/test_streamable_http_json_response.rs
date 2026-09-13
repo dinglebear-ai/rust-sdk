@@ -1,15 +1,20 @@
 #![cfg(not(feature = "local"))]
 use rmcp::{
-    ErrorData, ServerHandler,
+    ErrorData, ServerHandler, ServiceExt,
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
-        ProgressNotificationParam, ServerCapabilities, ServerInfo,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, CustomRequest,
+        CustomResult, ProgressNotificationParam, ServerCapabilities, ServerInfo,
     },
     service::RequestContext,
-    transport::streamable_http_server::{
-        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    transport::{
+        StreamableHttpClientTransport,
+        streamable_http_server::{
+            StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+        },
     },
 };
+use serde::Deserialize;
+use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 mod common;
@@ -55,6 +60,32 @@ const NEGOTIATED_CALL_WITH_PROGRESS_BODY: &str = r#"{
 
 #[derive(Clone)]
 struct ProgressServer;
+
+#[derive(Clone)]
+struct TypedExtensionServer;
+
+impl ServerHandler for TypedExtensionServer {
+    async fn on_custom_request(
+        &self,
+        _request: CustomRequest,
+        _context: RequestContext<rmcp::RoleServer>,
+    ) -> Result<CustomResult, ErrorData> {
+        Ok(CustomResult::new(json!({
+            "resultType": "complete",
+            "skills": ["http-skill"],
+            "_meta": {"source": "streamable-http"}
+        })))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TypedExtensionResult {
+    result_type: String,
+    skills: Vec<String>,
+    #[serde(rename = "_meta")]
+    meta: serde_json::Value,
+}
 
 impl ServerHandler for ProgressServer {
     fn get_info(&self) -> ServerInfo {
@@ -133,6 +164,43 @@ async fn spawn_progress_server(
     let client = reqwest::Client::new();
     let base_url = format!("http://{addr}/mcp");
     (client, base_url, ct)
+}
+
+#[tokio::test]
+async fn streamable_http_preserves_typed_extension_results() -> anyhow::Result<()> {
+    let ct = CancellationToken::new();
+    let service: StreamableHttpService<TypedExtensionServer, LocalSessionManager> =
+        StreamableHttpService::new(
+            || Ok(TypedExtensionServer),
+            Default::default(),
+            StreamableHttpServerConfig::default()
+                .with_legacy_session_mode(false)
+                .with_json_response(true)
+                .with_sse_keep_alive(None)
+                .with_cancellation_token(ct.child_token()),
+        );
+    let router = axum::Router::new().nest_service("/mcp", service);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let url = format!("http://{}/mcp", listener.local_addr()?);
+    let server_ct = ct.clone();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router)
+            .with_graceful_shutdown(async move { server_ct.cancelled().await })
+            .await;
+    });
+
+    let client = ().serve(StreamableHttpClientTransport::from_uri(url)).await?;
+    let result: TypedExtensionResult = client
+        .send_request_as(rmcp::model::ClientRequest::CustomRequest(
+            CustomRequest::new("skills/list", None),
+        ))
+        .await?;
+    assert_eq!(result.result_type, "complete");
+    assert_eq!(result.skills, ["http-skill"]);
+    assert_eq!(result.meta["source"], "streamable-http");
+    client.cancel().await?;
+    ct.cancel();
+    Ok(())
 }
 
 #[tokio::test]
