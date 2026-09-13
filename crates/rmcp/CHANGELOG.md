@@ -9,8 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- add `Peer::send_request_as` and option-aware typed request handles for
-  method-specific extension responses, plus an additive raw-response transport hook
+- add `Peer::send_request_as` and option-aware typed request handles that
+  preserve method-specific extension response fields across supported built-in
+  transports
+
+### Fixed
+
+- reject malformed, duplicate, non-UTF-8, and disallowed HTTP Origin headers consistently
+- compare HTTP origins using normalized effective ports instead of treating an omitted configured port as a wildcard
+
+## [3.3.0](https://github.com/modelcontextprotocol/rust-sdk/compare/rmcp-v3.2.0...rmcp-v3.3.0) - 2026-09-10
+
+### Added
+
+- add ServerHandler::negotiate_initialize ([#1247](https://github.com/modelcontextprotocol/rust-sdk/pull/1247))
+- *(macros)* reject empty tool_router ([#1233](https://github.com/modelcontextprotocol/rust-sdk/pull/1233))
+- *(auth)* add enterprise refresh-token and ID-JAG exchanges ([#1234](https://github.com/modelcontextprotocol/rust-sdk/pull/1234))
+
+### Fixed
+
+- *(sse)* saturate exponential reconnect backoff to avoid overflow panic ([#1231](https://github.com/modelcontextprotocol/rust-sdk/pull/1231))
+- resolve clippy warnings across workspace ([#1195](https://github.com/modelcontextprotocol/rust-sdk/pull/1195))
+- *(auth)* unify refresh checks and error handling ([#1236](https://github.com/modelcontextprotocol/rust-sdk/pull/1236))
+
+### Other
+
+- *(deps)* update process-wrap requirement from 9.0 to 10.0 ([#1229](https://github.com/modelcontextprotocol/rust-sdk/pull/1229))
+
+## [3.2.0](https://github.com/modelcontextprotocol/rust-sdk/compare/rmcp-v3.1.4...rmcp-v3.2.0) - 2026-08-31
+
+### Added
+
+- *(auth)* coordinate OAuth refreshes through credential stores ([#1232](https://github.com/modelcontextprotocol/rust-sdk/pull/1232))
+- add request-state key rotation ([#1128](https://github.com/modelcontextprotocol/rust-sdk/pull/1128))
+
+### Fixed
+
+- keep initialize on legacy protocol versions ([#1228](https://github.com/modelcontextprotocol/rust-sdk/pull/1228))
+- *(transport)* fall back after sessionless HTTP discover rejections ([#1211](https://github.com/modelcontextprotocol/rust-sdk/pull/1211))
+- allow concurrent streamable http requests ([#1186](https://github.com/modelcontextprotocol/rust-sdk/pull/1186))
 
 ## [3.1.4](https://github.com/modelcontextprotocol/rust-sdk/compare/rmcp-v3.1.3...rmcp-v3.1.4) - 2026-08-18
 

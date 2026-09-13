@@ -68,6 +68,9 @@ pub trait Worker: Sized + Send + 'static {
     fn config(&self) -> WorkerConfig {
         WorkerConfig::default()
     }
+    fn preserves_raw_responses() -> bool {
+        false
+    }
     /// Return true to send this message through the separate control queue.
     ///
     /// Workers that opt in must read [`WorkerContext::control_from_handler_rx`]
@@ -79,10 +82,6 @@ pub trait Worker: Sized + Send + 'static {
     ///
     /// Workers that opt in must honor [`WorkerSendRequest::cancellation_token`].
     fn supports_request_cancellation() -> bool {
-        false
-    }
-    /// Whether this worker sends inbound responses through the lossless raw path.
-    fn preserves_raw_responses() -> bool {
         false
     }
 }
@@ -333,12 +332,12 @@ pub struct SendRequest<W: Worker> {
 #[non_exhaustive]
 pub struct WorkerContext<W: Worker> {
     pub to_handler_tx: tokio::sync::mpsc::Sender<RxJsonRpcMessage<W::Role>>,
+    raw_to_handler_tx: tokio::sync::mpsc::Sender<RawRxJsonRpcMessage<W::Role>>,
     pub from_handler_rx: tokio::sync::mpsc::Receiver<WorkerSendRequest<W>>,
     /// Messages selected by [`Worker::is_control_message`].
     pub control_from_handler_rx: tokio::sync::mpsc::Receiver<WorkerSendRequest<W>>,
     pub cancellation_token: CancellationToken,
     control_generation: Arc<AtomicU64>,
-    raw_to_handler_tx: tokio::sync::mpsc::Sender<RawRxJsonRpcMessage<W::Role>>,
 }
 
 impl<W: Worker> WorkerContext<W> {
@@ -373,23 +372,19 @@ impl<W: Worker> WorkerContext<W> {
         Resp: serde::Serialize,
     {
         let item = match item {
-            crate::model::JsonRpcMessage::Request(request) => {
-                crate::model::JsonRpcMessage::Request(request)
-            }
-            crate::model::JsonRpcMessage::Response(response) => {
-                crate::model::JsonRpcMessage::Response(crate::model::JsonRpcResponse {
+            JsonRpcMessage::Request(request) => JsonRpcMessage::Request(request),
+            JsonRpcMessage::Response(response) => {
+                JsonRpcMessage::Response(crate::model::JsonRpcResponse {
                     jsonrpc: response.jsonrpc,
                     id: response.id,
                     result: serde_json::to_value(response.result)
                         .map_err(WorkerQuitReason::ResponseSerialization)?,
                 })
             }
-            crate::model::JsonRpcMessage::Notification(notification) => {
-                crate::model::JsonRpcMessage::Notification(notification)
+            JsonRpcMessage::Notification(notification) => {
+                JsonRpcMessage::Notification(notification)
             }
-            crate::model::JsonRpcMessage::Error(error) => {
-                crate::model::JsonRpcMessage::Error(error)
-            }
+            JsonRpcMessage::Error(error) => JsonRpcMessage::Error(error),
         };
         self.raw_to_handler_tx
             .send(item)
@@ -469,8 +464,7 @@ impl<W: Worker> Transport<W::Role> for WorkerTransport<W> {
     }
     async fn receive(&mut self) -> Option<RxJsonRpcMessage<W::Role>> {
         loop {
-            let message = self.rx.recv().await?;
-            match decode_peer_response::<W::Role>(message) {
+            match decode_peer_response::<W::Role>(self.rx.recv().await?) {
                 Ok(message) => return Some(message),
                 Err(error) => {
                     tracing::debug!(%error, "Ignoring response with invalid result shape")

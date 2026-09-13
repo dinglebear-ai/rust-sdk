@@ -13,11 +13,13 @@ use http::{HeaderName, HeaderValue};
 use hyper_util::rt::TokioIo;
 use rmcp::{
     ServiceExt,
+    model::{ClientRequest, CustomRequest},
     transport::{
         StreamableHttpClientTransport, UnixSocketHttpClient,
         streamable_http_client::StreamableHttpClientTransportConfig,
     },
 };
+use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::Mutex;
 
@@ -35,10 +37,10 @@ async fn mcp_handler(
     let mut headers_map = HashMap::new();
     for (name, value) in headers.iter() {
         let name_str = name.as_str();
-        if name_str.starts_with("x-") || name_str == "host" {
-            if let Ok(v) = value.to_str() {
-                headers_map.insert(name_str.to_string(), v.to_string());
-            }
+        if (name_str.starts_with("x-") || name_str == "host")
+            && let Ok(v) = value.to_str()
+        {
+            headers_map.insert(name_str.to_string(), v.to_string());
         }
     }
 
@@ -46,46 +48,67 @@ async fn mcp_handler(
     stored.extend(headers_map);
     drop(stored);
 
-    if let Ok(json_body) = serde_json::from_slice::<serde_json::Value>(&body) {
-        if let Some(method) = json_body.get("method").and_then(|m| m.as_str()) {
-            if method == "initialize" {
-                state.initialize_called.notify_one();
-                let response = json!({
-                    "jsonrpc": "2.0",
-                    "id": json_body.get("id"),
-                    "result": {
-                        "protocolVersion": "2024-11-05",
-                        "capabilities": {},
-                        "serverInfo": {
-                            "name": "test-unix-server",
-                            "version": "1.0.0"
-                        }
+    if let Ok(json_body) = serde_json::from_slice::<serde_json::Value>(&body)
+        && let Some(method) = json_body.get("method").and_then(|m| m.as_str())
+    {
+        if method == "initialize" {
+            state.initialize_called.notify_one();
+            let response = json!({
+                "jsonrpc": "2.0",
+                "id": json_body.get("id"),
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "serverInfo": {
+                        "name": "test-unix-server",
+                        "version": "1.0.0"
                     }
-                });
-                return (
-                    StatusCode::OK,
-                    [
-                        (http::header::CONTENT_TYPE, "application/json"),
-                        (
-                            http::HeaderName::from_static("mcp-session-id"),
-                            "unix-test-session",
-                        ),
-                    ],
-                    response.to_string(),
-                );
-            } else if method == "notifications/initialized" {
-                return (
-                    StatusCode::ACCEPTED,
-                    [
-                        (http::header::CONTENT_TYPE, "application/json"),
-                        (
-                            http::HeaderName::from_static("mcp-session-id"),
-                            "unix-test-session",
-                        ),
-                    ],
-                    String::new(),
-                );
-            }
+                }
+            });
+            return (
+                StatusCode::OK,
+                [
+                    (http::header::CONTENT_TYPE, "application/json"),
+                    (
+                        http::HeaderName::from_static("mcp-session-id"),
+                        "unix-test-session",
+                    ),
+                ],
+                response.to_string(),
+            );
+        } else if method == "notifications/initialized" {
+            return (
+                StatusCode::ACCEPTED,
+                [
+                    (http::header::CONTENT_TYPE, "application/json"),
+                    (
+                        http::HeaderName::from_static("mcp-session-id"),
+                        "unix-test-session",
+                    ),
+                ],
+                String::new(),
+            );
+        } else if method == "skills/list" {
+            let response = json!({
+                "jsonrpc": "2.0",
+                "id": json_body.get("id"),
+                "result": {
+                    "resultType": "complete",
+                    "skills": ["unix-example"],
+                    "_meta": {"vendorExtension": {"retained": true}}
+                }
+            });
+            return (
+                StatusCode::OK,
+                [
+                    (http::header::CONTENT_TYPE, "application/json"),
+                    (
+                        http::HeaderName::from_static("mcp-session-id"),
+                        "unix-test-session",
+                    ),
+                ],
+                response.to_string(),
+            );
         }
     }
 
@@ -109,6 +132,81 @@ async fn mcp_handler(
         ],
         response.to_string(),
     )
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct SkillsListResult {
+    result_type: String,
+    skills: Vec<String>,
+    #[serde(rename = "_meta")]
+    meta: serde_json::Value,
+}
+
+struct TemporarySocketDirectory(std::path::PathBuf);
+
+impl TemporarySocketDirectory {
+    fn new() -> std::io::Result<Self> {
+        // Keep the pathname below the small sockaddr_un limit on macOS; its
+        // resolved system temporary directory can itself be very long.
+        let path = std::path::Path::new("/tmp").join(format!("rmcp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&path)?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for TemporarySocketDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+struct AbortServerOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortServerOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Typed extension results must retain fields that the core response union does
+/// not know about when transported over a Unix-domain HTTP connection.
+#[tokio::test]
+async fn test_unix_socket_typed_custom_response_preserves_extension_fields() -> anyhow::Result<()> {
+    let dir = TemporarySocketDirectory::new()?;
+    let socket_path = dir.0.join("mcp.sock");
+
+    let state = ServerState {
+        received_headers: Arc::new(Mutex::new(HashMap::new())),
+        initialize_called: Arc::new(tokio::sync::Notify::new()),
+    };
+    let app = Router::new()
+        .route("/mcp", post(mcp_handler))
+        .with_state(state);
+    let listener = tokio::net::UnixListener::bind(&socket_path)?;
+    let _server_guard = AbortServerOnDrop(spawn_unix_server(listener, app));
+
+    let socket_str = socket_path.to_str().expect("UTF-8 temporary path");
+    let uri = "http://mcp-server.internal/mcp";
+    let transport = StreamableHttpClientTransport::with_client(
+        UnixSocketHttpClient::new(socket_str, uri),
+        StreamableHttpClientTransportConfig::with_uri(uri),
+    );
+    let client = ().serve(transport).await?;
+
+    let response: SkillsListResult = client
+        .send_request_as(ClientRequest::CustomRequest(CustomRequest::new(
+            "skills/list",
+            None,
+        )))
+        .await?;
+
+    assert_eq!(response.result_type, "complete");
+    assert_eq!(response.skills, ["unix-example"]);
+    assert_eq!(response.meta["vendorExtension"]["retained"], true);
+
+    client.cancel().await?;
+    Ok(())
 }
 
 /// Spawns an HTTP/1.1 server on a Unix socket using hyper directly.

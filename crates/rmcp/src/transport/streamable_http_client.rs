@@ -114,6 +114,36 @@ fn cache_tools_from_response(
     }
 }
 
+fn cache_tools_from_raw_response(
+    cache: &mut HashMap<String, Arc<JsonObject>>,
+    message: &mut RawRxJsonRpcMessage<RoleClient>,
+    protocol_version: &ProtocolVersion,
+) {
+    if protocol_version < &ProtocolVersion::STANDARD_HEADERS {
+        return;
+    }
+    if let crate::model::JsonRpcMessage::Response(response) = message
+        && let Some(tools) = response
+            .result
+            .get_mut("tools")
+            .and_then(serde_json::Value::as_array_mut)
+    {
+        tools.retain(|value| {
+            // Preserve the original JSON, including extension fields. Malformed
+            // tools remain for the normal response decoder to reject.
+            let Ok(tool) = serde_json::from_value::<crate::model::Tool>(value.clone()) else {
+                return true;
+            };
+            if let Err(reason) = mcp_headers::validate_param_header_annotations(&tool.input_schema) {
+                tracing::warn!(tool = %tool.name, "rejecting invalid x-mcp-header annotations: {reason}");
+                return false;
+            }
+            cache.insert(tool.name.to_string(), tool.input_schema);
+            true
+        });
+    }
+}
+
 fn negotiate_version_headers(
     init_response: &ServerJsonRpcMessage,
     base: HashMap<HeaderName, HeaderValue>,
@@ -245,7 +275,7 @@ pub enum StreamableHttpProtocolError {
     MissingSessionIdInResponse,
 }
 
-#[expect(
+#[allow(
     clippy::large_enum_variant,
     reason = "boxing the streaming response would add an allocation to the common response path"
 )]
@@ -390,7 +420,17 @@ pub(super) fn legacy_discover_response(
 /// handle the cancellation using state owned by that stream.
 pub trait StreamableHttpClient: Clone + Send + 'static {
     type Error: std::error::Error + Send + Sync + 'static;
-    /// Whether JSON responses are returned as [`StreamableHttpPostResponse::RawJson`].
+
+    /// Whether this backend preserves response result bodies as raw JSON.
+    ///
+    /// Returning `true` is a contract that all JSON responses use
+    /// [`StreamableHttpPostResponse::RawJson`] and that every SSE response path
+    /// yields events whose JSON-RPC result has not first been decoded through
+    /// [`ServerResult`]. Backends that cannot satisfy both requirements must
+    /// retain the default `false`; typed requests then fail before being sent.
+    /// The built-in reqwest and Unix-socket backends satisfy this contract.
+    /// The authenticated HTTP wrapper forwards the wrapped backend's
+    /// capability.
     fn preserves_raw_responses() -> bool {
         false
     }
@@ -662,13 +702,7 @@ impl<C: StreamableHttpClient> StreamableHttpClientWorker<C> {
         }
     }
 
-    fn server_response_id<Resp>(
-        message: &crate::model::JsonRpcMessage<
-            crate::model::ServerRequest,
-            Resp,
-            crate::model::ServerNotification,
-        >,
-    ) -> Option<&RequestId> {
+    fn server_response_id(message: &RawRxJsonRpcMessage<RoleClient>) -> Option<&RequestId> {
         match message {
             crate::model::JsonRpcMessage::Response(response) => Some(&response.id),
             crate::model::JsonRpcMessage::Error(error) => error.id.as_ref(),
@@ -676,13 +710,9 @@ impl<C: StreamableHttpClient> StreamableHttpClientWorker<C> {
         }
     }
 
-    fn clear_stream_response_pending<Resp>(
+    fn clear_stream_response_pending(
         pending_stream_response_ids: &mut HashSet<RequestId>,
-        message: &crate::model::JsonRpcMessage<
-            crate::model::ServerRequest,
-            Resp,
-            crate::model::ServerNotification,
-        >,
+        message: &RawRxJsonRpcMessage<RoleClient>,
     ) -> Option<RequestId> {
         let response_id = Self::server_response_id(message)?;
         if let Some(id) = pending_stream_response_ids.take(response_id) {
@@ -856,24 +886,11 @@ impl<C: StreamableHttpClient> StreamableHttpClientWorker<C> {
         }
     }
 
-    async fn execute_sse_stream<Resp: Send + 'static>(
+    async fn execute_sse_stream(
         sse_stream: impl Stream<
-            Item = Result<
-                crate::model::JsonRpcMessage<
-                    crate::model::ServerRequest,
-                    Resp,
-                    crate::model::ServerNotification,
-                >,
-                StreamableHttpError<C::Error>,
-            >,
+            Item = Result<RawRxJsonRpcMessage<RoleClient>, StreamableHttpError<C::Error>>,
         > + Send,
-        sse_worker_tx: tokio::sync::mpsc::Sender<
-            crate::model::JsonRpcMessage<
-                crate::model::ServerRequest,
-                Resp,
-                crate::model::ServerNotification,
-            >,
-        >,
+        sse_worker_tx: tokio::sync::mpsc::Sender<RawRxJsonRpcMessage<RoleClient>>,
         origin: InboundStreamOrigin,
         close_on_response: bool,
         ct: CancellationToken,
@@ -1681,8 +1698,17 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
                             context.send_to_handler(message).await?;
                             Ok(())
                         }
-                        Ok(StreamableHttpPostResponse::RawJson(message, ..)) => {
-                            context.send_to_handler(message).await?;
+                        Ok(StreamableHttpPostResponse::RawJson(mut raw_message, ..)) => {
+                            if matches!(&message, ClientJsonRpcMessage::Request(request)
+                                if matches!(&request.request, ClientRequest::ListToolsRequest(_)))
+                            {
+                                cache_tools_from_raw_response(
+                                    &mut tool_header_cache,
+                                    &mut raw_message,
+                                    &version,
+                                );
+                            }
+                            context.send_to_handler(raw_message).await?;
                             Ok(())
                         }
                         Ok(StreamableHttpPostResponse::Sse(stream, ..)) => {
@@ -1756,7 +1782,7 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
                     }
                     let _ = responder.send(send_result);
                 }
-                Event::ServerMessage(json_rpc_message) => {
+                Event::ServerMessage(mut json_rpc_message) => {
                     // Match against all pending requests, not just open response streams.
                     if let Some(request_id) = Self::clear_stream_response_pending(
                         &mut pending_stream_response_ids,
@@ -1764,15 +1790,11 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
                     ) {
                         drop(request_stream_cancellations.remove(&request_id));
                     }
-                    if let Ok(mut typed_message) =
-                        decode_peer_response::<RoleClient>(json_rpc_message.clone())
-                    {
-                        cache_tools_from_response(
-                            &mut tool_header_cache,
-                            &mut typed_message,
-                            &negotiated_version,
-                        );
-                    }
+                    cache_tools_from_raw_response(
+                        &mut tool_header_cache,
+                        &mut json_rpc_message,
+                        &negotiated_version,
+                    );
                     // send the message to the handler
                     if let Err(e) = context.send_to_handler(json_rpc_message).await {
                         break 'main_loop Err(e);
@@ -2209,9 +2231,9 @@ mod tests {
         deprecated,
         reason = "Sampling is deprecated by SEP-2577 but remains the canonical restricted request"
     )]
-    fn sampling_request_message(id: i64) -> ServerJsonRpcMessage {
+    fn sampling_request_message(id: i64) -> RawRxJsonRpcMessage<RoleClient> {
         use crate::model::{CreateMessageRequest, CreateMessageRequestParams, SamplingMessage};
-        ServerJsonRpcMessage::request(
+        RawRxJsonRpcMessage::<RoleClient>::request(
             ServerRequest::CreateMessageRequest(CreateMessageRequest::new(
                 CreateMessageRequestParams::new(vec![SamplingMessage::user_text("hi")], 16),
             )),
@@ -2225,8 +2247,9 @@ mod tests {
             InboundStreamOrigin::Unassociated,
             InboundStreamOrigin::OutboundRequest(RequestId::Number(3)),
         ] {
-            let response = ServerJsonRpcMessage::response(
-                ServerResult::ListToolsResult(ListToolsResult::default()),
+            let response = RawRxJsonRpcMessage::<RoleClient>::response(
+                serde_json::to_value(ServerResult::ListToolsResult(ListToolsResult::default()))
+                    .unwrap(),
                 NumberOrString::Number(1),
             );
             let stream = futures::stream::iter([Ok(sampling_request_message(9)), Ok(response)]);
@@ -2241,7 +2264,7 @@ mod tests {
             .await
             .expect("stream completes");
 
-            let ServerJsonRpcMessage::Request(request) =
+            let crate::model::JsonRpcMessage::Request(request) =
                 rx.recv().await.expect("request forwarded")
             else {
                 panic!("expected request first");
@@ -2254,7 +2277,7 @@ mod tests {
             // Responses are correlated by JSON-RPC id; no marker needed or added.
             assert!(matches!(
                 rx.recv().await.expect("response forwarded"),
-                ServerJsonRpcMessage::Response(_)
+                crate::model::JsonRpcMessage::Response(_)
             ));
         }
     }
@@ -2304,8 +2327,9 @@ mod tests {
                 .lock()
                 .expect("lock reconnects")
                 .push((session_id.map(|id| id.to_string()), last_event_id));
-            let response = ServerJsonRpcMessage::response(
-                ServerResult::ListToolsResult(ListToolsResult::default()),
+            let response = RawRxJsonRpcMessage::<RoleClient>::response(
+                serde_json::to_value(ServerResult::ListToolsResult(ListToolsResult::default()))
+                    .expect("serialize response"),
                 NumberOrString::Number(1),
             );
             Ok(futures::stream::once(async move {
@@ -2343,6 +2367,7 @@ mod tests {
                 Arc::new(ExponentialBackoff {
                     max_times: Some(1),
                     base_duration: Duration::ZERO,
+                    max_delay: None,
                 }),
             );
         let mut stream = std::pin::pin!(stream);
@@ -2400,8 +2425,9 @@ mod tests {
                 .expect("lock reconnects")
                 .push((session_id.map(|id| id.to_string()), last_event_id));
             let request = sampling_request_message(9);
-            let response = ServerJsonRpcMessage::response(
-                ServerResult::ListToolsResult(ListToolsResult::default()),
+            let response = RawRxJsonRpcMessage::<RoleClient>::response(
+                serde_json::to_value(ServerResult::ListToolsResult(ListToolsResult::default()))
+                    .expect("serialize response"),
                 NumberOrString::Number(1),
             );
             // Stay open after the response, like a live connection, so the
@@ -2447,6 +2473,7 @@ mod tests {
                 Arc::new(ExponentialBackoff {
                     max_times: Some(1),
                     base_duration: Duration::ZERO,
+                    max_delay: None,
                 }),
             );
 
@@ -2532,6 +2559,36 @@ mod tests {
     }
 
     #[test]
+    fn raw_tool_cache_preserves_extensions_and_filters_invalid_annotations() {
+        let mut valid = serde_json::to_value(tool(
+            "valid",
+            json!({"type": "string", "x-mcp-header": "Value"}),
+        ))
+        .unwrap();
+        valid["vendorExtension"] = json!({"retained": true});
+        let invalid = serde_json::to_value(tool(
+            "invalid",
+            json!({"type": "string", "x-mcp-header": ""}),
+        ))
+        .unwrap();
+        let mut message = RawRxJsonRpcMessage::<RoleClient>::response(
+            json!({"tools": [valid.clone(), invalid], "vendorResult": 42}),
+            NumberOrString::Number(1),
+        );
+        let mut cache = HashMap::new();
+        cache_tools_from_raw_response(&mut cache, &mut message, &ProtocolVersion::V_2026_07_28);
+        assert!(cache.contains_key("valid"));
+        assert!(!cache.contains_key("invalid"));
+        let crate::model::JsonRpcMessage::Response(response) = message else {
+            panic!("response")
+        };
+        assert_eq!(
+            response.result,
+            json!({"tools": [valid], "vendorResult": 42})
+        );
+    }
+
+    #[test]
     fn cache_tools_preserves_pre_standard_header_results() {
         let invalid = tool("legacy", json!({ "type": "string", "x-mcp-header": "" }));
         let mut message = ServerJsonRpcMessage::response(
@@ -2558,12 +2615,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn raw_tool_cache_preserves_legacy_results_and_malformed_tools() {
+        let malformed = json!({"name": "broken", "inputSchema": "not-an-object"});
+        let invalid = serde_json::to_value(tool("legacy", json!({"x-mcp-header": ""}))).unwrap();
+        let original = json!({"tools": [invalid, malformed.clone()], "vendorResult": 42});
+        let mut message = RawRxJsonRpcMessage::<RoleClient>::response(
+            original.clone(),
+            NumberOrString::Number(1),
+        );
+        let mut cache = HashMap::new();
+        cache_tools_from_raw_response(&mut cache, &mut message, &ProtocolVersion::V_2025_11_25);
+        assert!(cache.is_empty());
+        let crate::model::JsonRpcMessage::Response(response) = &message else {
+            panic!("response")
+        };
+        assert_eq!(response.result, original);
+
+        cache_tools_from_raw_response(&mut cache, &mut message, &ProtocolVersion::V_2026_07_28);
+        assert!(cache.is_empty());
+        let crate::model::JsonRpcMessage::Response(response) = message else {
+            panic!("response")
+        };
+        assert_eq!(
+            response.result,
+            json!({"tools": [malformed], "vendorResult": 42})
+        );
+    }
+
     #[cfg(feature = "transport-streamable-http-client-reqwest")]
     #[test]
     fn clear_stream_response_pending_accepts_stringified_numeric_id() {
         let mut pending = HashSet::from([NumberOrString::Number(1)]);
-        let response = ServerJsonRpcMessage::response(
-            ServerResult::ListToolsResult(ListToolsResult::default()),
+        let response = RawRxJsonRpcMessage::<RoleClient>::response(
+            serde_json::to_value(ServerResult::ListToolsResult(ListToolsResult::default()))
+                .unwrap(),
             NumberOrString::String("1".into()),
         );
 
@@ -2582,8 +2668,9 @@ mod tests {
     fn clear_stream_response_pending_prefers_exact_string_id() {
         let string_id = NumberOrString::String("1".into());
         let mut pending = HashSet::from([NumberOrString::Number(1), string_id.clone()]);
-        let response = ServerJsonRpcMessage::response(
-            ServerResult::ListToolsResult(ListToolsResult::default()),
+        let response = RawRxJsonRpcMessage::<RoleClient>::response(
+            serde_json::to_value(ServerResult::ListToolsResult(ListToolsResult::default()))
+                .unwrap(),
             string_id.clone(),
         );
 
