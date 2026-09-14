@@ -1,8 +1,11 @@
 #![cfg(not(feature = "local"))]
 //! Streamable HTTP protocol-version and request-metadata validation tests.
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    borrow::Cow,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use rmcp::{
@@ -13,9 +16,58 @@ use rmcp::{
 };
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
+use tower_service::Service;
 
 mod common;
 use common::calculator::Calculator;
+
+#[derive(Clone)]
+struct ModernOnlyServer;
+
+impl ServerHandler for ModernOnlyServer {
+    fn supported_protocol_versions(&self) -> Cow<'static, [rmcp::model::ProtocolVersion]> {
+        Cow::Borrowed(&[rmcp::model::ProtocolVersion::V_2026_07_28])
+    }
+
+    async fn initialize(
+        &self,
+        request: rmcp::model::InitializeRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::InitializeResult, rmcp::ErrorData> {
+        if request.protocol_version == rmcp::model::ProtocolVersion::V_2026_07_28 {
+            Err(rmcp::ErrorData::new(
+                rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+                "initialize is not part of the modern lifecycle",
+                None,
+            ))
+        } else {
+            Err(rmcp::ErrorData::unsupported_protocol_version(
+                request.protocol_version,
+                &[rmcp::model::ProtocolVersion::V_2026_07_28],
+            ))
+        }
+    }
+}
+
+async fn spawn_modern_only_server(
+    config: StreamableHttpServerConfig,
+) -> (reqwest::Client, String, CancellationToken) {
+    let ct = config.cancellation_token.clone();
+    let service: StreamableHttpService<ModernOnlyServer, LocalSessionManager> =
+        StreamableHttpService::new(|| Ok(ModernOnlyServer), Default::default(), config);
+    let router = axum::Router::new().nest_service("/mcp", service);
+    let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = tcp_listener.local_addr().unwrap();
+    tokio::spawn({
+        let ct = ct.clone();
+        async move {
+            let _ = axum::serve(tcp_listener, router)
+                .with_graceful_shutdown(async move { ct.cancelled_owned().await })
+                .await;
+        }
+    });
+    (reqwest::Client::new(), format!("http://{addr}/mcp"), ct)
+}
 
 fn init_body(body_version: &str) -> String {
     format!(
@@ -575,6 +627,13 @@ async fn seam_disabled_preserves_stateless_compatibility() -> anyhow::Result<()>
         "seam-disabled stateless config must dispatch exactly once"
     );
 
+    let response = post_init(&client, &url, Some("2026-07-28"), "2026-07-28").await;
+    assert_eq!(
+        response.status(),
+        200,
+        "seam-disabled initialize must retain its standard-header exemption"
+    );
+
     ct.cancel();
     Ok(())
 }
@@ -829,14 +888,77 @@ async fn seam_opt_in_preserves_standard_header_precedence() -> anyhow::Result<()
     Ok(())
 }
 
-// `initialize` is exempt from the new required-header check while retaining
-// its existing optional-header and header/body consistency rules.
 #[tokio::test]
-async fn seam_opt_in_preserves_initialize_rules() -> anyhow::Result<()> {
+async fn seam_opt_in_returns_jsonrpc_for_non_utf8_protocol_header() -> anyhow::Result<()> {
+    let config = modern_required_config();
+    let (server, lists) = CountingServer::new();
+    let mut service: StreamableHttpService<CountingServer, LocalSessionManager> =
+        StreamableHttpService::new(move || Ok(server.clone()), Default::default(), config);
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}"#;
+    let mut request = http::Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("host", "localhost")
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-method", "tools/list")
+        .body(axum::body::Body::from(body))?;
+    request.headers_mut().insert(
+        "mcp-protocol-version",
+        http::HeaderValue::from_bytes(&[0xff])?,
+    );
+
+    let response = service
+        .call(request)
+        .await
+        .expect("infallible HTTP service");
+    assert_eq!(response.status(), 400);
+    assert_eq!(response.headers()["content-type"], "application/json");
+    let body =
+        axum::body::to_bytes(axum::body::Body::new(response.into_body()), 1024 * 1024).await?;
+    let payload: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(payload["id"], 1);
+    assert_eq!(payload["error"]["code"], -32020);
+    assert_eq!(lists.load(Ordering::SeqCst), 0);
+
+    Ok(())
+}
+
+// Strict stateless mode requires the modern transport headers on initialize;
+// the relaxed mode and stateful legacy session path remain compatible.
+#[tokio::test]
+async fn seam_opt_in_enforces_initialize_headers() -> anyhow::Result<()> {
     let (client, url, ct) = spawn_server(modern_required_config()).await;
 
     let response = post_init(&client, &url, None, "2025-11-25").await;
-    assert_eq!(response.status(), 200);
+    assert_eq!(response.status(), 400);
+    let payload: serde_json::Value = response.json().await?;
+    assert_eq!(payload["id"], 1);
+    assert_eq!(payload["error"]["code"], -32020);
+
+    let response = post_seam(
+        &client,
+        &url,
+        &init_body("2026-07-28"),
+        Some("2026-07-28"),
+        &[],
+    )
+    .await;
+    assert_eq!(response.status(), 400);
+    let payload: serde_json::Value = response.json().await?;
+    assert_eq!(payload["error"]["code"], -32020);
+
+    let response = post_seam(
+        &client,
+        &url,
+        &init_body("2026-07-28"),
+        Some("2026-07-28"),
+        &[("Mcp-Method", "tools/list")],
+    )
+    .await;
+    assert_eq!(response.status(), 400);
+    let payload: serde_json::Value = response.json().await?;
+    assert_eq!(payload["error"]["code"], -32020);
 
     let response = post_init(&client, &url, Some("2025-11-25"), "2025-11-25").await;
     assert_eq!(response.status(), 200);
@@ -845,6 +967,41 @@ async fn seam_opt_in_preserves_initialize_rules() -> anyhow::Result<()> {
     assert_eq!(response.status(), 400);
     let payload: serde_json::Value = response.json().await?;
     assert_eq!(payload["error"]["code"], -32600);
+
+    ct.cancel();
+    Ok(())
+}
+
+#[tokio::test]
+async fn seam_opt_in_maps_initialize_protocol_errors_to_modern_http_statuses() -> anyhow::Result<()>
+{
+    let (client, url, ct) = spawn_modern_only_server(modern_required_config()).await;
+
+    let response = post_seam(
+        &client,
+        &url,
+        &init_body("2025-11-25"),
+        Some("2025-11-25"),
+        &[("Mcp-Method", "initialize")],
+    )
+    .await;
+    assert_eq!(response.status(), 400);
+    let payload: serde_json::Value = response.json().await?;
+    assert_eq!(payload["id"], 1);
+    assert_eq!(payload["error"]["code"], -32022);
+
+    let response = post_seam(
+        &client,
+        &url,
+        &init_body("2026-07-28"),
+        Some("2026-07-28"),
+        &[("Mcp-Method", "initialize")],
+    )
+    .await;
+    assert_eq!(response.status(), 404);
+    let payload: serde_json::Value = response.json().await?;
+    assert_eq!(payload["id"], 1);
+    assert_eq!(payload["error"]["code"], -32601);
 
     ct.cancel();
     Ok(())
