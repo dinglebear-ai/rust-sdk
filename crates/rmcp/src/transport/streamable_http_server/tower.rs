@@ -559,11 +559,11 @@ fn validate_request_protocol_version_meta(
 }
 
 /// When `stateless_protocol_metadata_required` is enabled in stateless mode,
-/// every non-initialize Streamable HTTP JSON-RPC request POST must carry the
+/// every Streamable HTTP JSON-RPC request POST must carry the
 /// `MCP-Protocol-Version` HTTP header. A missing header is rejected with
 /// HTTP 400 / JSON-RPC `-32020` before handler dispatch. `server/discover`
-/// is included so the seam aligns with the per-POST header contract; its
-/// body-metadata rule is preserved unchanged.
+/// and `initialize` are included so the seam aligns with the per-POST header
+/// contract; their body-metadata rules are preserved unchanged.
 fn validate_required_protocol_header(
     config: &StreamableHttpServerConfig,
     headers: &HeaderMap,
@@ -576,12 +576,14 @@ fn validate_required_protocol_header(
         // Notifications, response messages, and error messages are exempt.
         return Ok(());
     };
-    if matches!(&request.request, ClientRequest::InitializeRequest(_)) {
-        // Initialize keeps its own header-matching rule.
-        return Ok(());
-    }
-    if headers.contains_key(HEADER_MCP_PROTOCOL_VERSION) {
-        return Ok(());
+    if let Some(version) = headers.get(HEADER_MCP_PROTOCOL_VERSION) {
+        return version.to_str().map(|_| ()).map_err(|_| {
+            header_mismatch_jsonrpc_response(
+                Some(request.id.clone()),
+                "MCP-Protocol-Version header is not valid UTF-8",
+            )
+            .into()
+        });
     }
     Err(header_mismatch_jsonrpc_response(
         Some(request.id.clone()),
@@ -672,12 +674,15 @@ fn header_mismatch_jsonrpc_response(
 /// Validates SEP-2243 `Mcp-Method` / `Mcp-Name` / `Mcp-Param-*` headers against the body.
 ///
 /// Only enforced when the request declares a protocol version `>= STANDARD_HEADERS`.
-/// The `initialize` handshake is exempt: clients emit these headers only after the
-/// version has been negotiated. `tool_schema` supplies the called tool's input schema
-/// so annotated `Mcp-Param-*` headers can be checked (no schema => those are skipped).
+/// Legacy `initialize` remains exempt because its version predates these headers;
+/// an `initialize` request that selects a version requiring standard headers is
+/// validated like every other request. `tool_schema` supplies the called tool's
+/// input schema so annotated `Mcp-Param-*` headers can be checked (no schema =>
+/// those are skipped).
 fn validate_standard_headers(
     headers: &HeaderMap,
     message: &ClientJsonRpcMessage,
+    enforce_initialize: bool,
     tool_schema: impl Fn(&str) -> Option<Arc<JsonObject>>,
 ) -> HttpResult<()> {
     let version_requires_headers = headers
@@ -690,7 +695,7 @@ fn validate_standard_headers(
 
     let request_id = match message {
         ClientJsonRpcMessage::Request(req) => {
-            if matches!(&req.request, ClientRequest::InitializeRequest(_)) {
+            if matches!(&req.request, ClientRequest::InitializeRequest(_)) && !enforce_initialize {
                 return Ok(());
             }
             Some(req.id.clone())
@@ -1756,7 +1761,9 @@ where
                 validate_protocol_version_header(&part.headers, has_per_request_version)?;
                 validate_request_protocol_version_meta(&part.headers, &message)?;
                 // Validate SEP-2243 standard headers against the body
-                validate_standard_headers(&part.headers, &message, |name| self.tool_schema(name))?;
+                validate_standard_headers(&part.headers, &message, false, |name| {
+                    self.tool_schema(name)
+                })?;
 
                 // inject request part to extensions
                 match &mut message {
@@ -1808,7 +1815,7 @@ where
                         &part.headers,
                         message_has_per_request_protocol_version(&message),
                     )?;
-                    validate_standard_headers(&part.headers, &message, |name| {
+                    validate_standard_headers(&part.headers, &message, false, |name| {
                         self.tool_schema(name)
                     })?;
                     validate_request_protocol_version_meta(&part.headers, &message)?;
@@ -1938,7 +1945,12 @@ where
                 }
             }
             // Validate SEP-2243 standard headers against the body
-            validate_standard_headers(&part.headers, &message, |name| self.tool_schema(name))?;
+            validate_standard_headers(
+                &part.headers,
+                &message,
+                self.config.stateless_protocol_metadata_required,
+                |name| self.tool_schema(name),
+            )?;
             validate_request_protocol_version_meta(&part.headers, &message)?;
             validate_required_protocol_meta(&self.config, &message)?;
             let service = self
@@ -2010,14 +2022,10 @@ where
                             message,
                             ServerJsonRpcMessage::Response(_) | ServerJsonRpcMessage::Error(_)
                         ) {
-                            let body = serde_json::to_vec(&message).map_err(|e| {
-                                internal_error_response("serialize json response")(e)
-                            })?;
-                            Ok(Response::builder()
-                                .status(http::StatusCode::OK)
-                                .header(http::header::CONTENT_TYPE, JSON_MIME_TYPE)
-                                .body(Full::new(Bytes::from(body)).boxed())
-                                .expect("valid response"))
+                            jsonrpc_message_response(
+                                message,
+                                self.config.stateless_protocol_metadata_required,
+                            )
                         } else {
                             Ok(self.stateless_sse_response(Some(message), receiver, request_ct))
                         }
