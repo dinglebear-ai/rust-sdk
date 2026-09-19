@@ -1,6 +1,6 @@
 use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::stream::BoxStream;
 use http::{HeaderName, HeaderValue, Method, Request, StatusCode, header::WWW_AUTHENTICATE};
 use http_body_util::{BodyExt, Full};
@@ -34,6 +34,8 @@ pub enum UnixSocketError {
     Http(#[from] http::Error),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("response_too_large: received more than {max_bytes} bytes")]
+    ResponseTooLarge { max_bytes: usize },
 }
 
 impl From<UnixSocketError> for StreamableHttpError<UnixSocketError> {
@@ -66,6 +68,7 @@ impl From<UnixSocketError> for StreamableHttpError<UnixSocketError> {
 pub struct UnixSocketHttpClient {
     socket_path: Arc<str>,
     host_header: HeaderValue,
+    max_response_bytes: Option<usize>,
 }
 
 impl UnixSocketHttpClient {
@@ -97,7 +100,15 @@ impl UnixSocketHttpClient {
         Self {
             socket_path: resolve_socket_path(socket_path).into(),
             host_header,
+            max_response_bytes: None,
         }
+    }
+
+    /// Limit buffered non-SSE response bodies read from the socket.
+    #[must_use]
+    pub fn with_max_response_bytes(mut self, max_response_bytes: usize) -> Self {
+        self.max_response_bytes = Some(max_response_bytes);
+        self
     }
 }
 
@@ -147,6 +158,25 @@ async fn send_http_request(
     });
 
     Ok(sender.send_request(request).await?)
+}
+
+async fn collect_response_body(
+    mut body: Incoming,
+    max_response_bytes: Option<usize>,
+) -> Result<Bytes, UnixSocketError> {
+    let mut buffer = BytesMut::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame?;
+        if let Ok(data) = frame.into_data() {
+            if let Some(max_bytes) = max_response_bytes
+                && buffer.len().saturating_add(data.len()) > max_bytes
+            {
+                return Err(UnixSocketError::ResponseTooLarge { max_bytes });
+            }
+            buffer.extend_from_slice(&data);
+        }
+    }
+    Ok(buffer.freeze())
 }
 
 /// Applies custom headers to a request builder, rejecting reserved headers.
@@ -272,12 +302,10 @@ impl StreamableHttpClient for UnixSocketHttpClient {
         }
 
         if !status.is_success() {
-            let body = response
-                .into_body()
-                .collect()
+            let body = collect_response_body(response.into_body(), self.max_response_bytes)
                 .await
-                .map(|c| String::from_utf8_lossy(&c.to_bytes()).into_owned())
-                .unwrap_or_else(|_| "<failed to read response body>".to_owned());
+                .map_err(StreamableHttpError::Client)?;
+            let body = String::from_utf8_lossy(&body).into_owned();
             if let Some(response) =
                 legacy_discover_response(&message, session_was_attached, status, &body)
             {
@@ -319,12 +347,9 @@ impl StreamableHttpClient for UnixSocketHttpClient {
                 Ok(StreamableHttpPostResponse::Sse(sse_stream, session_id))
             }
             Some(ref ct) if ct.as_bytes().starts_with(JSON_MIME_TYPE.as_bytes()) => {
-                let body = response
-                    .into_body()
-                    .collect()
+                let body = collect_response_body(response.into_body(), self.max_response_bytes)
                     .await
-                    .map_err(|e| StreamableHttpError::Client(UnixSocketError::Hyper(e)))?
-                    .to_bytes();
+                    .map_err(StreamableHttpError::Client)?;
                 match serde_json::from_slice::<crate::service::RawRxJsonRpcMessage<crate::RoleClient>>(
                     &body,
                 ) {
