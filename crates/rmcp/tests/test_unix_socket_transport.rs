@@ -238,6 +238,74 @@ fn spawn_unix_server(
     })
 }
 
+/// A configured body cap must reject oversized buffered JSON responses before deserialization.
+#[tokio::test]
+async fn test_unix_socket_response_body_cap() -> anyhow::Result<()> {
+    let dir = TemporarySocketDirectory::new()?;
+    let socket_path = dir.0.join("mcp.sock");
+    let app = Router::new().route(
+        "/mcp",
+        post(|| async {
+            (
+                StatusCode::OK,
+                [(http::header::CONTENT_TYPE, "application/json")],
+                "x".repeat(1024),
+            )
+        }),
+    );
+    let listener = tokio::net::UnixListener::bind(&socket_path)?;
+    let _server_guard = AbortServerOnDrop(spawn_unix_server(listener, app));
+
+    let socket_str = socket_path.to_str().expect("UTF-8 temporary path");
+    let uri = "http://mcp-server.internal/mcp";
+    let client = UnixSocketHttpClient::new(socket_str, uri).with_max_response_bytes(128);
+    let transport = StreamableHttpClientTransport::with_client(
+        client,
+        StreamableHttpClientTransportConfig::with_uri("/mcp"),
+    );
+
+    let error = ().serve(transport).await.expect_err("oversized response must fail");
+    assert!(
+        error.to_string().contains("response_too_large"),
+        "unexpected error: {error}"
+    );
+    Ok(())
+}
+
+/// The body cap also applies to non-success HTTP responses before error formatting.
+#[tokio::test]
+async fn test_unix_socket_error_response_body_cap() -> anyhow::Result<()> {
+    let dir = TemporarySocketDirectory::new()?;
+    let socket_path = dir.0.join("mcp.sock");
+    let app = Router::new().route(
+        "/mcp",
+        post(|| async {
+            (
+                StatusCode::BAD_GATEWAY,
+                [(http::header::CONTENT_TYPE, "text/plain")],
+                "x".repeat(1024),
+            )
+        }),
+    );
+    let listener = tokio::net::UnixListener::bind(&socket_path)?;
+    let _server_guard = AbortServerOnDrop(spawn_unix_server(listener, app));
+
+    let socket_str = socket_path.to_str().expect("UTF-8 temporary path");
+    let uri = "http://mcp-server.internal/mcp";
+    let client = UnixSocketHttpClient::new(socket_str, uri).with_max_response_bytes(128);
+    let transport = StreamableHttpClientTransport::with_client(
+        client,
+        StreamableHttpClientTransportConfig::with_uri("/mcp"),
+    );
+
+    let error = ().serve(transport).await.expect_err("oversized error response must fail");
+    assert!(
+        error.to_string().contains("response_too_large"),
+        "unexpected error: {error}"
+    );
+    Ok(())
+}
+
 /// Integration test: MCP client connects and completes handshake over a Unix domain socket.
 #[tokio::test]
 async fn test_unix_socket_mcp_handshake() -> anyhow::Result<()> {
