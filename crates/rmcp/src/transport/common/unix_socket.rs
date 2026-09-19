@@ -105,6 +105,14 @@ impl UnixSocketHttpClient {
     }
 
     /// Limit buffered non-SSE response bodies read from the socket.
+    ///
+    /// The limit applies before JSON/error-body deserialization, so callers can
+    /// bound memory used by successful JSON responses and non-success HTTP
+    /// response bodies. SSE responses remain governed separately by the
+    /// transport's `max_sse_event_size`. Without this builder the buffered-body
+    /// limit is disabled for backward compatibility.
+    ///
+    /// Exceeding the limit returns [`UnixSocketError::ResponseTooLarge`].
     #[must_use]
     pub fn with_max_response_bytes(mut self, max_response_bytes: usize) -> Self {
         self.max_response_bytes = Some(max_response_bytes);
