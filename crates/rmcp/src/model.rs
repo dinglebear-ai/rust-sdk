@@ -4165,8 +4165,9 @@ pub struct CallToolResult {
 // 1. Defaults `content` to `[]` when the field is missing (lenient per Postel's law)
 // 2. Requires at least one tool-specific field to be present, so protocol-generic
 //    fields such as `resultType` and `_meta` do not make `CallToolResult` greedily
-//    match custom-extension responses inside `#[serde(untagged)]` enums (e.g.
-//    `ServerResult`), which would shadow `CustomResult`.
+//    match other results inside `#[serde(untagged)]` enums (e.g. `ServerResult`),
+//    which would shadow `TaskAckResult` and `CustomResult`. A legacy result made of
+//    `_meta` alone is still accepted.
 // 3. Rejects non-`complete` result types so other `ServerResult` variants can match.
 // 4. Keeps a present `"structuredContent": null` as `Some(Value::Null)`, distinct
 //    from an absent field, since structured content can be any JSON value.
@@ -4186,6 +4187,8 @@ impl<'de> Deserialize<'de> for CallToolResult {
             is_error: Option<bool>,
             #[serde(rename = "_meta")]
             meta: Option<MetaObject>,
+            #[serde(flatten)]
+            other: std::collections::HashMap<String, serde::de::IgnoredAny>,
         }
 
         let helper = Helper::deserialize(deserializer)?;
@@ -4200,13 +4203,20 @@ impl<'de> Deserialize<'de> for CallToolResult {
             ));
         }
 
+        // `_meta` can appear on any result, so it only identifies a tool
+        // result when it is the only field, the legacy shape that predates
+        // `resultType`. Otherwise a custom result or task ack carrying `_meta`
+        // would decode as an empty tool result and lose its fields.
+        let legacy_meta_only =
+            helper.meta.is_some() && helper.result_type.is_none() && helper.other.is_empty();
         if helper.content.is_none()
             && helper.structured_content.is_none()
             && helper.is_error.is_none()
+            && !legacy_meta_only
         {
             return Err(serde::de::Error::custom(
                 "expected at least one tool-specific CallToolResult field \
-                 (content, structuredContent, or isError)",
+                 (content, structuredContent, or isError), or _meta alone",
             ));
         }
 
@@ -5050,6 +5060,116 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    fn decode(value: serde_json::Value) -> ServerResult {
+        serde_json::from_value(value).expect("decodes")
+    }
+
+    fn with_meta(mut value: serde_json::Value) -> serde_json::Value {
+        value.as_object_mut().unwrap().insert(
+            "_meta".into(),
+            json!({"io.modelcontextprotocol/serverInfo": {"name": "s", "version": "1"}}),
+        );
+        value
+    }
+
+    #[test]
+    fn custom_results_with_meta_are_not_read_as_tool_results() {
+        for value in [
+            json!({"resultType": "complete", "events": [], "cursor": "c1"}),
+            json!({"resultType": "complete", "id": "sub_1", "refreshBefore": "2026-01-01T00:00:00Z"}),
+            json!({"eventTypes": [], "nextCursor": null}),
+            json!({"anything": 1}),
+            json!({"x": null}),
+            // Field names are camelCase; snake_case is not a tool field.
+            json!({"is_error": true}),
+        ] {
+            let value = with_meta(value);
+            match decode(value.clone()) {
+                ServerResult::CustomResult(CustomResult(decoded)) => assert_eq!(decoded, value),
+                other => panic!("{value} decoded as {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn tool_results_with_meta_still_decode_as_tool_results() {
+        for value in [
+            // The legacy shape: `_meta` alone.
+            json!({}),
+            // Known tool fields still win over unknown ones.
+            json!({"content": [{"type": "text", "text": "hi"}], "x-vendor": 1}),
+            json!({"isError": false, "x-vendor": 1}),
+            json!({"structuredContent": null, "x-vendor": 1}),
+        ] {
+            let value = with_meta(value);
+            assert!(
+                matches!(decode(value.clone()), ServerResult::CallToolResult(_)),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn task_ack_with_meta_is_not_read_as_a_tool_result() {
+        let value = with_meta(json!({"resultType": "complete"}));
+        let decoded = decode(value.clone());
+        assert!(
+            matches!(decoded, ServerResult::TaskAckResult(_)),
+            "{value} decoded as {decoded:?}"
+        );
+    }
+
+    /// A regression guard: variants other than `CallToolResult` still decode
+    /// as themselves with `_meta` added.
+    #[test]
+    fn other_results_with_meta_keep_their_variant() {
+        type IsVariant = fn(&ServerResult) -> bool;
+        let cases: Vec<(serde_json::Value, IsVariant)> = vec![
+            (json!({"completion": {"values": []}}), |r| {
+                matches!(r, ServerResult::CompleteResult(_))
+            }),
+            (json!({"messages": []}), |r| {
+                matches!(r, ServerResult::GetPromptResult(_))
+            }),
+            (json!({"prompts": []}), |r| {
+                matches!(r, ServerResult::ListPromptsResult(_))
+            }),
+            (json!({"resources": []}), |r| {
+                matches!(r, ServerResult::ListResourcesResult(_))
+            }),
+            (json!({"resourceTemplates": []}), |r| {
+                matches!(r, ServerResult::ListResourceTemplatesResult(_))
+            }),
+            (json!({"contents": []}), |r| {
+                matches!(r, ServerResult::ReadResourceResult(_))
+            }),
+            (json!({"tools": []}), |r| {
+                matches!(r, ServerResult::ListToolsResult(_))
+            }),
+            (json!({"action": "decline"}), |r| {
+                matches!(r, ServerResult::ElicitResult(_))
+            }),
+            (
+                json!({"resultType": "input_required", "requestState": "s"}),
+                |r| matches!(r, ServerResult::InputRequiredResult(_)),
+            ),
+        ];
+        for (value, expected) in cases {
+            let value = with_meta(value);
+            let decoded = decode(value.clone());
+            assert!(expected(&decoded), "{value} decoded as {decoded:?}");
+        }
+        // A listen result is identified by its `_meta` key.
+        let listen = json!({
+            "resultType": "complete",
+            "_meta": {"io.modelcontextprotocol/subscriptionId": 1},
+        });
+        assert!(matches!(
+            decode(listen),
+            ServerResult::SubscriptionsListenResult(_)
+        ));
+    }
 
     #[test]
     fn known_versions_are_ordered_oldest_first() {
