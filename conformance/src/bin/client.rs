@@ -356,6 +356,63 @@ async fn perform_oauth_flow_preregistered(
     Ok(AuthClient::new(reqwest::Client::default(), am))
 }
 
+/// Exercise the production ephemeral DPoP token/key binding and HTTP transport.
+async fn run_dpop_client(server_url: &str) -> anyhow::Result<()> {
+    use rmcp::transport::auth::{
+        default_oauth_http_client,
+        dpop::{DpopKey, DpopOAuthHttpClient},
+    };
+    let challenge = initialize_challenge(server_url, conformance_lifecycle()).await?;
+    let resolver = AuthorizationManager::new(server_url).await?;
+    let resolution = resolver
+        .resolve_metadata_from_challenge(challenge.as_deref())
+        .await?;
+    anyhow::ensure!(
+        resolution
+            .metadata
+            .additional_fields
+            .get("dpop_signing_alg_values_supported")
+            .and_then(|v| v.as_array())
+            .is_some_and(|algs| algs.iter().any(|a| a.as_str() == Some("ES256"))),
+        "AS does not advertise ES256 DPoP"
+    );
+    let proof_http = std::sync::Arc::new(DpopOAuthHttpClient::new(
+        std::sync::Arc::new(default_oauth_http_client()?),
+        std::sync::Arc::new(DpopKey::generate()?),
+        &resolution.metadata.token_endpoint,
+        server_url,
+    )?);
+    let mut manager =
+        AuthorizationManager::new_with_oauth_http_client(server_url, proof_http.clone()).await?;
+    manager.set_metadata(resolution.metadata);
+    manager
+        .register_client("conformance-client", REDIRECT_URI, &[])
+        .await?;
+    let scopes = manager.select_scopes(None, &[]);
+    let refs: Vec<_> = scopes.iter().map(String::as_str).collect();
+    let auth_url = manager.get_authorization_url(&refs).await?;
+    let callback = headless_authorize(&auth_url).await?;
+    manager
+        .exchange_code_for_token_with_issuer(
+            &callback.code,
+            &callback.csrf_token,
+            callback.issuer.as_deref(),
+        )
+        .await?;
+    let transport = StreamableHttpClientTransport::with_client(
+        proof_http.resource_client(server_url)?,
+        StreamableHttpClientTransportConfig::with_uri(server_url),
+    );
+    let client = BasicClientHandler.serve(transport).await?;
+    let tools = client.list_tools(Default::default()).await?;
+    for tool in tools.tools {
+        let args = build_tool_arguments(&tool);
+        let _ = client.call_tool(call_tool_params(tool.name, args)).await;
+    }
+    client.cancel().await?;
+    Ok(())
+}
+
 /// Run the standard auth flow, then connect and exercise the server.
 async fn run_auth_client(server_url: &str, ctx: &ConformanceContext) -> anyhow::Result<()> {
     let auth_client = perform_oauth_flow(server_url, ctx).await?;
@@ -1266,6 +1323,7 @@ async fn run_scenario(
         }
 
         // Auth - client credentials
+        "auth/dpop" | "auth/dpop-nonce" => run_dpop_client(server_url).await?,
         "auth/client-credentials-basic" => run_client_credentials_basic(server_url, ctx).await?,
         "auth/client-credentials-jwt" => run_client_credentials_jwt(server_url, ctx).await?,
 
