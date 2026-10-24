@@ -3630,21 +3630,23 @@ impl AuthorizationManager {
         let assertion =
             Self::build_jwt_assertion(client_id, audience, signing_key, *signing_algorithm)?;
 
-        let scope_str = scopes.join(" ");
-        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
-        serializer.append_pair("grant_type", "client_credentials");
-        serializer.append_pair(
-            "client_assertion_type",
-            "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-        );
-        serializer.append_pair("client_assertion", &assertion);
-        if !scope_str.is_empty() {
-            serializer.append_pair("scope", &scope_str);
-        }
-        if let Some(res) = resource.as_deref() {
-            serializer.append_pair("resource", res);
-        }
-        let body_str = serializer.finish();
+        let body_str = {
+            let scope_str = scopes.join(" ");
+            let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+            serializer.append_pair("grant_type", "client_credentials");
+            serializer.append_pair(
+                "client_assertion_type",
+                "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+            );
+            serializer.append_pair("client_assertion", &assertion);
+            if !scope_str.is_empty() {
+                serializer.append_pair("scope", &scope_str);
+            }
+            if let Some(res) = resource.as_deref() {
+                serializer.append_pair("resource", res);
+            }
+            serializer.finish()
+        };
 
         let request = oauth2::http::Request::builder()
             .method("POST")
@@ -4397,6 +4399,21 @@ impl OAuthState {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "auth-client-credentials-jwt")]
+    #[tokio::test]
+    async fn client_credentials_exchange_future_is_send() {
+        fn assert_send(_: impl Send) {}
+        let manager = super::AuthorizationManager::new("https://resource.example/mcp")
+            .await
+            .unwrap();
+        let config = super::ClientCredentialsConfig::ClientSecret {
+            client_id: "fixture-client".into(),
+            client_secret: "fixture-secret".into(),
+            scopes: vec!["read".into()],
+            resource: Some("https://resource.example/mcp".into()),
+        };
+        assert_send(manager.exchange_client_credentials(&config));
+    }
     use std::{
         collections::{HashMap, VecDeque},
         sync::{Arc, Mutex as StdMutex},
