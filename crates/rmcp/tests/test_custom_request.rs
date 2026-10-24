@@ -100,7 +100,7 @@ async fn legacy_transport_preserves_standard_response_without_raw_round_trip() -
     let client = serve_directly::<RoleClient, _, _, _, _>(
         (),
         transport,
-        Some(rmcp::model::ServerInfo::default().into()),
+        Some(rmcp::model::ServerConfig::default().into()),
     );
 
     let typed = client
@@ -325,7 +325,7 @@ async fn json_tool_listing_populates_parameter_headers_through_auth_client() -> 
         ClientServiceExt,
         model::{
             CallToolRequestParams, CallToolResponse, CallToolResult, ListToolsResult,
-            PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+            PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
         },
         service::RequestContext,
         transport::{
@@ -348,8 +348,8 @@ async fn json_tool_listing_populates_parameter_headers_through_auth_client() -> 
             std::borrow::Cow::Borrowed(&[rmcp::model::ProtocolVersion::V_2026_07_28])
         }
 
-        fn get_info(&self) -> ServerInfo {
-            ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
         }
 
         fn get_tool(&self, name: &str) -> Option<Tool> {

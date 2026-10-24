@@ -13,10 +13,12 @@ use http::{HeaderName, HeaderValue};
 use hyper_util::rt::TokioIo;
 use rmcp::{
     ServiceExt,
-    model::{ClientRequest, CustomRequest},
+    model::{ClientJsonRpcMessage, ClientRequest, CustomRequest, PingRequest, RequestId},
     transport::{
         StreamableHttpClientTransport, UnixSocketHttpClient,
-        streamable_http_client::StreamableHttpClientTransportConfig,
+        streamable_http_client::{
+            StreamableHttpClient, StreamableHttpClientTransportConfig, StreamableHttpError,
+        },
     },
 };
 use serde::Deserialize;
@@ -238,6 +240,40 @@ fn spawn_unix_server(
     })
 }
 
+/// A configured body cap must reject oversized buffered JSON responses before deserialization.
+#[tokio::test]
+async fn test_unix_socket_response_body_cap() -> anyhow::Result<()> {
+    let dir = TemporarySocketDirectory::new()?;
+    let socket_path = dir.0.join("mcp.sock");
+    let app = Router::new().route(
+        "/mcp",
+        post(|| async {
+            (
+                StatusCode::OK,
+                [(http::header::CONTENT_TYPE, "application/json")],
+                "x".repeat(1024),
+            )
+        }),
+    );
+    let listener = tokio::net::UnixListener::bind(&socket_path)?;
+    let _server_guard = AbortServerOnDrop(spawn_unix_server(listener, app));
+
+    let socket_str = socket_path.to_str().expect("UTF-8 temporary path");
+    let uri = "http://mcp-server.internal/mcp";
+    let client = UnixSocketHttpClient::new(socket_str, uri).with_max_response_bytes(128);
+    let transport = StreamableHttpClientTransport::with_client(
+        client,
+        StreamableHttpClientTransportConfig::with_uri("/mcp"),
+    );
+
+    let error = ().serve(transport).await.expect_err("oversized response must fail");
+    assert!(
+        error.to_string().contains("response_too_large"),
+        "unexpected error: {error}"
+    );
+    Ok(())
+}
+
 /// Integration test: MCP client connects and completes handshake over a Unix domain socket.
 #[tokio::test]
 async fn test_unix_socket_mcp_handshake() -> anyhow::Result<()> {
@@ -392,5 +428,58 @@ async fn test_unix_socket_convenience_constructor() -> anyhow::Result<()> {
     let _ = std::fs::remove_file(&socket_path);
     let _ = std::fs::remove_dir(&dir);
 
+    Ok(())
+}
+
+/// A request POST that gets 200 + `application/json` + `{}` must error.
+/// Mapping that body to Accepted would hang the caller waiting on SSE.
+#[tokio::test]
+async fn test_unix_socket_request_malformed_json_is_unexpected() -> anyhow::Result<()> {
+    let dir = std::env::temp_dir().join(format!("rmcp-test-bad-json-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let socket_path = dir.join("mcp.sock");
+    let _ = std::fs::remove_file(&socket_path);
+
+    async fn bad_json_handler() -> impl IntoResponse {
+        (
+            StatusCode::OK,
+            [(http::header::CONTENT_TYPE, "application/json")],
+            "{}",
+        )
+    }
+
+    let app = Router::new().route("/mcp", post(bad_json_handler));
+    let listener = tokio::net::UnixListener::bind(&socket_path)?;
+    let server_handle = spawn_unix_server(listener, app);
+
+    let socket_str = socket_path.to_str().unwrap();
+    let uri = "http://localhost/mcp";
+    let client = UnixSocketHttpClient::new(socket_str, uri);
+    let result = client
+        .post_message(
+            Arc::from(uri),
+            ClientJsonRpcMessage::request(
+                ClientRequest::PingRequest(PingRequest::default()),
+                RequestId::Number(1),
+            ),
+            None,
+            None,
+            HashMap::new(),
+        )
+        .await;
+
+    server_handle.abort();
+    let _ = std::fs::remove_file(&socket_path);
+    let _ = std::fs::remove_dir(&dir);
+
+    match result {
+        Err(StreamableHttpError::UnexpectedServerResponse(ref msg)) => {
+            assert!(
+                msg.contains("{}"),
+                "expected body preview in error, got: {msg}"
+            );
+        }
+        other => panic!("expected UnexpectedServerResponse, got: {other:?}"),
+    }
     Ok(())
 }

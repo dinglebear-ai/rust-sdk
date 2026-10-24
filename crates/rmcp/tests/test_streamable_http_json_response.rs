@@ -3,7 +3,7 @@ use rmcp::{
     ErrorData, ServerHandler, ServiceExt,
     model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, CustomRequest,
-        CustomResult, ProgressNotificationParam, ServerCapabilities, ServerInfo,
+        CustomResult, ProgressNotificationParam, ServerCapabilities, ServerConfig,
     },
     service::RequestContext,
     transport::{
@@ -88,8 +88,8 @@ struct TypedExtensionResult {
 }
 
 impl ServerHandler for ProgressServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 
     async fn call_tool(

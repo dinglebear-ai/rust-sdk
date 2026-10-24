@@ -247,9 +247,41 @@ pub enum StreamableHttpError<E: std::error::Error + Send + Sync + 'static> {
     /// Session recovery timed out. The server may have processed an interrupted POST.
     #[error("Session recovery timed out; the server may have processed the POST")]
     SessionRecoveryTimeout,
+    /// The server answered the session re-initialization with a JSON-RPC error.
+    #[error("Session re-initialization failed: {0}")]
+    ReinitializationFailed(ErrorData),
     /// A cancellation or reply POST did not finish in time.
     #[error("Control POST timed out")]
     ControlRequestTimeout,
+}
+
+/// Bytes of an unusable JSON body kept in
+/// [`StreamableHttpError::UnexpectedServerResponse`].
+pub(crate) const JSON_RPC_BODY_PREVIEW_LEN: usize = 256;
+
+/// Short, lossy view of a body that failed to parse as JSON-RPC.
+pub(crate) fn json_rpc_body_preview(body: &[u8]) -> Cow<'static, str> {
+    if body.is_empty() {
+        return Cow::Borrowed("<empty>");
+    }
+    let lossy = String::from_utf8_lossy(body);
+    if lossy.len() <= JSON_RPC_BODY_PREVIEW_LEN {
+        return Cow::Owned(lossy.into_owned());
+    }
+    let mut end = JSON_RPC_BODY_PREVIEW_LEN;
+    while end > 0 && !lossy.is_char_boundary(end) {
+        end -= 1;
+    }
+    Cow::Owned(lossy[..end].to_owned())
+}
+
+/// Request-POST parse failure, including a body preview so empty / HTML / `{}`
+/// are distinguishable from the serde diagnostic alone.
+pub(crate) fn json_rpc_parse_error_message(err: &serde_json::Error, body: &[u8]) -> String {
+    format!(
+        "could not parse JSON response as ServerJsonRpcMessage: {err}: {}",
+        json_rpc_body_preview(body)
+    )
 }
 
 impl<E: std::error::Error + Send + Sync + 'static> StreamableHttpError<E> {
@@ -322,7 +354,10 @@ impl StreamableHttpPostResponse {
                     let raw: RawRxJsonRpcMessage<RoleClient> = serde_json::from_str(&payload)?;
                     let message = decode_peer_response::<RoleClient>(raw)?;
 
-                    if matches!(message, ServerJsonRpcMessage::Response(_)) {
+                    if matches!(
+                        message,
+                        ServerJsonRpcMessage::Response(_) | ServerJsonRpcMessage::Error(_)
+                    ) {
                         return Ok((message, session_id));
                     }
 
@@ -372,11 +407,15 @@ impl StreamableHttpPostResponse {
 }
 
 /// Convert a sessionless discovery rejection into a response the lifecycle
-/// layer can classify as a legacy-server signal.
+/// layer can classify. The server's own JSON-RPC error is preserved so the
+/// lifecycle can tell a modern rejection (retry at a supported version) from a
+/// legacy one; `invalid_request` is synthesized only when the body has no error
+/// to keep, as with an empty or plain-text 4xx from middleware.
 ///
-/// Some legacy streamable-HTTP servers reject `server/discover` in middleware
-/// before it reaches JSON-RPC dispatch. Their response may be an empty or
-/// plain-text 4xx, so there is no JSON-RPC error for the client to forward.
+/// The id is re-correlated because such middleware rejections cannot echo it
+/// (the Python SDK sends the literal `"server-error"`); otherwise the lifecycle
+/// discards the response as uncorrelated without classifying it.
+///
 /// Keep authentication failures and server errors on their original paths.
 pub(super) fn legacy_discover_response(
     message: &ClientJsonRpcMessage,
@@ -398,10 +437,13 @@ pub(super) fn legacy_discover_response(
         return None;
     }
 
-    let error = ErrorData::invalid_request(
-        format!("server/discover rejected with HTTP {status}: {body}"),
-        None,
-    );
+    let error = match serde_json::from_str::<ServerJsonRpcMessage>(body) {
+        Ok(ServerJsonRpcMessage::Error(error)) => error.error,
+        _ => ErrorData::invalid_request(
+            format!("server/discover rejected with HTTP {status}: {body}"),
+            None,
+        ),
+    };
     Some(StreamableHttpPostResponse::Json(
         ServerJsonRpcMessage::error(error, Some(request.id.clone())),
         None,
@@ -1008,7 +1050,8 @@ impl<C: StreamableHttpClient> StreamableHttpClientWorker<C> {
     /// protocol version, sends `notifications/initialized`, and returns the new
     /// `(session_id, protocol_headers)` pair.  The init result message is **not**
     /// forwarded to the handler because the handler already processed the original
-    /// initialization.
+    /// initialization. If the server answers the initialize with a JSON-RPC error,
+    /// returns an error without sending `notifications/initialized`.
     async fn perform_reinitialization(
         client: C,
         saved_init_request: ClientJsonRpcMessage,
@@ -1036,6 +1079,9 @@ impl<C: StreamableHttpClient> StreamableHttpClientWorker<C> {
             .await?
             .expect_initialized::<C::Error>()
             .await?;
+        if let ServerJsonRpcMessage::Error(error) = init_msg {
+            return Err(StreamableHttpError::ReinitializationFailed(error.error));
+        }
 
         let new_session_id: Option<Arc<str>> = new_session_id_str.map(|s| Arc::from(s.as_str()));
 
@@ -2227,6 +2273,32 @@ mod tests {
         service::InboundStreamOrigin,
     };
 
+    #[test]
+    fn json_rpc_body_preview_empty_html_and_object() {
+        assert_eq!(json_rpc_body_preview(b""), "<empty>");
+        assert_eq!(json_rpc_body_preview(b"{}"), "{}");
+        assert_eq!(
+            json_rpc_body_preview(b"<html>not json</html>"),
+            "<html>not json</html>"
+        );
+    }
+
+    #[test]
+    fn json_rpc_body_preview_truncates_long_bodies() {
+        let long = vec![b'x'; JSON_RPC_BODY_PREVIEW_LEN + 40];
+        let preview = json_rpc_body_preview(&long);
+        assert_eq!(preview.len(), JSON_RPC_BODY_PREVIEW_LEN);
+        assert!(preview.chars().all(|c| c == 'x'));
+    }
+
+    #[test]
+    fn json_rpc_parse_error_message_includes_preview() {
+        let err = serde_json::from_slice::<ServerJsonRpcMessage>(b"{}").unwrap_err();
+        let msg = json_rpc_parse_error_message(&err, b"{}");
+        assert!(msg.contains("could not parse JSON response as ServerJsonRpcMessage"));
+        assert!(msg.contains("{}"), "missing body preview: {msg}");
+    }
+
     #[expect(
         deprecated,
         reason = "Sampling is deprecated by SEP-2577 but remains the canonical restricted request"
@@ -2585,6 +2657,46 @@ mod tests {
         assert_eq!(
             response.result,
             json!({"tools": [valid], "vendorResult": 42})
+        );
+    }
+
+    #[test]
+    fn cache_tools_keeps_nested_annotations_and_drops_array_annotations() {
+        let nested = tool(
+            "nested",
+            json!({
+                "type": "object",
+                "properties": { "region": { "type": "string", "x-mcp-header": "Region" } },
+            }),
+        );
+        let in_items = tool(
+            "in_items",
+            json!({ "type": "array", "items": { "type": "string", "x-mcp-header": "Item" } }),
+        );
+        let mut message = ServerJsonRpcMessage::response(
+            ServerResult::ListToolsResult(ListToolsResult::with_all_items(vec![nested, in_items])),
+            NumberOrString::Number(1),
+        );
+        let mut cache = HashMap::new();
+
+        cache_tools_from_response(&mut cache, &mut message, &ProtocolVersion::V_2026_07_28);
+
+        let ServerJsonRpcMessage::Response(response) = &mut message else {
+            panic!("expected tools/list response");
+        };
+        let ServerResult::ListToolsResult(result) = &mut response.result else {
+            panic!("expected tools/list result");
+        };
+        assert_eq!(
+            (
+                result
+                    .tools
+                    .iter()
+                    .map(|tool| tool.name.as_ref())
+                    .collect::<Vec<_>>(),
+                cache.keys().map(String::as_str).collect::<Vec<_>>(),
+            ),
+            (vec!["nested"], vec!["nested"])
         );
     }
 
