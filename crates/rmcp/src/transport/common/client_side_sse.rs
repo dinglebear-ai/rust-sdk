@@ -167,6 +167,19 @@ fn is_event_too_large_error(error: &SseError) -> bool {
 
 pub trait SseRetryPolicy: std::fmt::Debug + Send + Sync {
     fn retry(&self, current_times: usize) -> Option<Duration>;
+
+    /// Decide whether to reconnect while honoring the server's minimum delay.
+    /// Returning `None` declines the reconnect, including a server-requested one.
+    /// Implementations may decline an excessive server delay but must not return
+    /// a delay shorter than `server_hint`.
+    fn retry_with_server_hint(
+        &self,
+        current_times: usize,
+        server_hint: Option<Duration>,
+    ) -> Option<Duration> {
+        self.retry(current_times)
+            .map(|delay| server_hint.map_or(delay, |hint| hint.max(delay)))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -454,12 +467,19 @@ where
                             }
                             this.connector
                                 .handle_stream_error(&e, this.last_event_id.as_deref());
-                            let retrying = this
-                                .connector
-                                .retry_connection(this.last_event_id.as_deref());
-                            SseAutoReconnectStreamState::Retrying {
-                                retry_times: 0,
-                                retrying,
+                            if let Some(interval) = this
+                                .retry_policy
+                                .retry_with_server_hint(0, *this.server_retry_interval)
+                            {
+                                SseAutoReconnectStreamState::WaitingNextRetry {
+                                    sleep: tokio::time::sleep(interval),
+                                    retry_times: 0,
+                                }
+                            } else {
+                                this.state.set(SseAutoReconnectStreamState::Terminated);
+                                return Poll::Ready(
+                                    this.connector.map_fatal_stream_error(e).map(Err),
+                                );
                             }
                         }
                         None => {
@@ -474,9 +494,8 @@ where
                             // reconnectable.  If the server sent a `retry` field
                             // we MUST wait that long before reconnecting.
                             let interval = this
-                                .server_retry_interval
-                                .take()
-                                .or_else(|| this.retry_policy.retry(0));
+                                .retry_policy
+                                .retry_with_server_hint(0, *this.server_retry_interval);
                             if let Some(interval) = interval {
                                 tracing::debug!(
                                     ?interval,
@@ -505,13 +524,10 @@ where
                         Err(e) => {
                             tracing::debug!("retry sse stream error: {e}");
                             *retry_times += 1;
-                            if let Some(interval) = this.retry_policy.retry(*retry_times) {
-                                let interval = this
-                                    .server_retry_interval
-                                    .map(|server_retry_interval| {
-                                        server_retry_interval.max(interval)
-                                    })
-                                    .unwrap_or(interval);
+                            if let Some(interval) = this
+                                .retry_policy
+                                .retry_with_server_hint(*retry_times, *this.server_retry_interval)
+                            {
                                 let sleep = tokio::time::sleep(interval);
                                 SseAutoReconnectStreamState::WaitingNextRetry {
                                     sleep,
@@ -576,6 +592,173 @@ mod tests {
         fn map_fatal_stream_error(&mut self, error: SseError) -> Option<Self::Error> {
             Some(TestReconnectError::Sse(error))
         }
+    }
+
+    #[tokio::test]
+    async fn sse_policy_never_retry_cannot_be_bypassed_by_a_server_hint() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let source = futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
+            b"retry: 0\nid: cursor\nevent: ping\ndata: keepalive\n\n",
+        ))]);
+        let stream = SseAutoReconnectStream::new(
+            bounded_sse_stream(source, 1024),
+            CountingReconnect {
+                attempts: attempts.clone(),
+            },
+            Arc::new(NeverRetry),
+        );
+        let mut stream = std::pin::pin!(stream);
+        assert!(stream.next().await.is_none());
+        assert_eq!(attempts.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn sse_policy_finite_limit_cannot_be_bypassed_by_a_server_hint() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let source = futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
+            b"retry: 0\nid: cursor\nevent: ping\ndata: keepalive\n\n",
+        ))]);
+        let stream = SseAutoReconnectStream::new(
+            bounded_sse_stream(source, 1024),
+            CountingReconnect {
+                attempts: attempts.clone(),
+            },
+            Arc::new(FixedInterval {
+                max_times: Some(0),
+                duration: Duration::ZERO,
+            }),
+        );
+        let mut stream = std::pin::pin!(stream);
+        assert!(stream.next().await.is_none());
+        assert_eq!(attempts.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn sse_policy_never_retry_also_prevents_an_immediate_error_reconnect() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let source =
+            futures::stream::iter([Err::<Bytes, _>(std::io::Error::other("broken stream"))]);
+        let stream = SseAutoReconnectStream::new(
+            bounded_sse_stream(source, 1024),
+            CountingReconnect {
+                attempts: attempts.clone(),
+            },
+            Arc::new(NeverRetry),
+        );
+        let mut stream = std::pin::pin!(stream);
+        assert!(matches!(
+            stream.next().await,
+            Some(Err(TestReconnectError::Sse(_)))
+        ));
+        assert_eq!(attempts.load(Ordering::Relaxed), 0);
+    }
+
+    #[derive(Debug)]
+    struct BoundedServerHint;
+    impl SseRetryPolicy for BoundedServerHint {
+        fn retry(&self, _current_times: usize) -> Option<Duration> {
+            Some(Duration::ZERO)
+        }
+        fn retry_with_server_hint(
+            &self,
+            current_times: usize,
+            server_hint: Option<Duration>,
+        ) -> Option<Duration> {
+            if server_hint.is_some_and(|hint| hint > Duration::from_millis(10)) {
+                None
+            } else {
+                self.retry(current_times)
+                    .map(|delay| server_hint.unwrap_or(delay).max(delay))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sse_policy_can_decline_an_excessive_server_hint_without_reconnecting_early() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let source = futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
+            b"retry: 3600000\nid: cursor\nevent: ping\ndata: keepalive\n\n",
+        ))]);
+        let stream = SseAutoReconnectStream::new(
+            bounded_sse_stream(source, 1024),
+            CountingReconnect {
+                attempts: attempts.clone(),
+            },
+            Arc::new(BoundedServerHint),
+        );
+        let mut stream = std::pin::pin!(stream);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), stream.next())
+                .await
+                .expect("policy rejection must not sleep for the server hint")
+                .is_none()
+        );
+        assert_eq!(attempts.load(Ordering::Relaxed), 0);
+    }
+
+    struct ResettingReconnect {
+        attempts: Arc<AtomicUsize>,
+    }
+    impl SseStreamReconnect for ResettingReconnect {
+        type Error = TestReconnectError;
+        type Future = futures::future::Ready<Result<BoxedSseResponse, Self::Error>>;
+        fn retry_connection(&mut self, _last_event_id: Option<&str>) -> Self::Future {
+            let attempt = self.attempts.fetch_add(1, Ordering::Relaxed) + 1;
+            if attempt == 2 {
+                futures::future::ready(Ok(bounded_sse_stream(
+                    futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
+                        b"id: resumed\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
+                    ))]),
+                    1024,
+                )))
+            } else {
+                futures::future::ready(Err(TestReconnectError::Reconnect))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sse_policy_successful_get_resets_consecutive_failure_budget() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let stream = SseAutoReconnectStream::new(
+            futures::stream::empty().boxed(),
+            ResettingReconnect {
+                attempts: attempts.clone(),
+            },
+            Arc::new(FixedInterval {
+                max_times: Some(2),
+                duration: Duration::ZERO,
+            }),
+        );
+        let mut stream = std::pin::pin!(stream);
+        assert!(matches!(stream.next().await, Some(Ok(_))));
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert!(matches!(
+            stream.next().await,
+            Some(Err(TestReconnectError::Reconnect))
+        ));
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            4,
+            "successful GET permits a fresh two-attempt failure window"
+        );
+    }
+
+    #[test]
+    fn sse_policy_default_server_hint_preserves_the_server_minimum() {
+        let policy = FixedInterval {
+            max_times: Some(2),
+            duration: Duration::from_millis(10),
+        };
+        assert_eq!(
+            policy.retry_with_server_hint(0, Some(Duration::from_millis(40))),
+            Some(Duration::from_millis(40))
+        );
+        assert_eq!(
+            policy.retry_with_server_hint(0, Some(Duration::from_millis(5))),
+            Some(Duration::from_millis(10))
+        );
+        assert_eq!(policy.retry_with_server_hint(2, Some(Duration::ZERO)), None);
     }
 
     #[tokio::test]
