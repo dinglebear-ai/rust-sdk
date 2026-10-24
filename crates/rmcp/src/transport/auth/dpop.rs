@@ -127,6 +127,11 @@ fn validate_nonce(nonce: &str) -> Result<(), DpopError> {
     }
     Ok(())
 }
+fn sensitive_header(value: &str) -> Result<http::HeaderValue, DpopError> {
+    let mut header = http::HeaderValue::from_str(value).map_err(|_| DpopError::Binding)?;
+    header.set_sensitive(true);
+    Ok(header)
+}
 fn nonce(headers: &http::HeaderMap) -> Result<Option<String>, DpopError> {
     headers
         .get("dpop-nonce")
@@ -318,10 +323,9 @@ impl OAuthHttpClient for DpopOAuthHttpClient {
                     current_nonce.as_deref(),
                     None,
                 )?;
-                template.headers_mut().insert(
-                    "dpop",
-                    http::HeaderValue::from_str(&proof).map_err(|_| DpopError::Binding)?,
-                );
+                template
+                    .headers_mut()
+                    .insert("dpop", sensitive_header(&proof)?);
                 let remaining = request
                     .timeout
                     .map(|limit| limit.saturating_sub(started.elapsed()));
@@ -397,6 +401,7 @@ impl DpopClient {
         token: String,
     ) -> Result<Self, DpopError> {
         let http = builder
+            .connection_verbose(false)
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(30))
             .build()
@@ -411,6 +416,26 @@ impl DpopClient {
     }
     pub(crate) fn http_client(&self) -> &reqwest::Client {
         &self.http
+    }
+    fn authorize_resource_request(
+        &self,
+        template: &mut reqwest::Request,
+        nonce: Option<&str>,
+    ) -> Result<(), DpopError> {
+        let proof = self.key.proof(
+            template.method().as_str(),
+            template.url().as_str(),
+            nonce,
+            Some(&self.token),
+        )?;
+        template
+            .headers_mut()
+            .insert("dpop", sensitive_header(&proof)?);
+        template.headers_mut().insert(
+            http::header::AUTHORIZATION,
+            sensitive_header(&format!("DPoP {}", self.token))?,
+        );
+        Ok(())
     }
     pub(crate) async fn send_resource_request(
         &self,
@@ -430,21 +455,7 @@ impl DpopClient {
         }
         for attempt in 0..2 {
             let n = self.nonce.lock().map_err(|_| DpopError::Binding)?.clone();
-            let proof = self.key.proof(
-                template.method().as_str(),
-                template.url().as_str(),
-                n.as_deref(),
-                Some(&self.token),
-            )?;
-            template.headers_mut().insert(
-                "dpop",
-                http::HeaderValue::from_str(&proof).map_err(|_| DpopError::Binding)?,
-            );
-            template.headers_mut().insert(
-                http::header::AUTHORIZATION,
-                http::HeaderValue::from_str(&format!("DPoP {}", self.token))
-                    .map_err(|_| DpopError::Binding)?,
-            );
+            self.authorize_resource_request(&mut template, n.as_deref())?;
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
                 return Err(DpopError::Http);

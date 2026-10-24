@@ -72,6 +72,7 @@ impl OAuthHttpClient for Scripted {
     fn execute(&self, request: OAuthHttpRequest) -> OAuthHttpClientFuture<'_> {
         Box::pin(async move {
             assert_eq!(request.redirect_policy, OAuthHttpRedirectPolicy::Stop);
+            assert!(request.request.headers()["dpop"].is_sensitive());
             self.proofs.lock().unwrap().push(
                 request.request.headers()["dpop"]
                     .to_str()
@@ -434,4 +435,30 @@ async fn foreign_resource_token_grant_is_rejected_before_dispatch() {
         b"grant_type=authorization_code&resource=https%3A%2F%2Fother.example".to_vec();
     assert!(wrapper.execute(request).await.is_err());
     assert!(inner.proofs.lock().unwrap().is_empty());
+}
+
+#[test]
+fn authorized_resource_request_debug_redacts_proof_and_access_token() {
+    let client = DpopClient::bound(
+        reqwest::Client::builder().connection_verbose(true),
+        Arc::new(DpopKey::generate().unwrap()),
+        "https://mcp.example/mcp",
+        "private-access-token".into(),
+    )
+    .unwrap();
+    let mut request = client
+        .http
+        .post("https://mcp.example/mcp")
+        .body("request-body")
+        .build()
+        .unwrap();
+    client
+        .authorize_resource_request(&mut request, None)
+        .unwrap();
+    let proof = request.headers()["dpop"].to_str().unwrap();
+    let rendered = format!("{request:?}");
+    assert!(!rendered.contains("private-access-token"));
+    assert!(!rendered.contains(proof));
+    assert!(request.headers()["authorization"].is_sensitive());
+    assert!(request.headers()["dpop"].is_sensitive());
 }
