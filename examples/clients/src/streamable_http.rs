@@ -2,7 +2,7 @@ use anyhow::Result;
 use rmcp::{
     ClientLifecycleMode, ClientServiceExt,
     model::{
-        CallToolRequestParams, ClientCapabilities, ClientInfo, Implementation, ProtocolVersion,
+        CallToolRequestParams, ClientCapabilities, ClientConfig, Implementation, ProtocolVersion,
     },
     transport::StreamableHttpClientTransport,
 };
@@ -18,7 +18,7 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
     let transport = StreamableHttpClientTransport::from_uri("http://localhost:8000/mcp");
-    let client_info = ClientInfo::new(
+    let client_info = ClientConfig::new(
         ClientCapabilities::default(),
         Implementation::new("streamable-http-client", "0.0.1"),
     );

@@ -1,5 +1,6 @@
 [package]
 name = "rmcp"
+exclude = ["tests/test_package_license.rs"]
 license = { workspace = true }
 version = { workspace = true }
 edition = { workspace = true }
@@ -121,6 +122,10 @@ chrono = { version = "0.4.38", default-features = false, features = [
   "oldtime",
 ] }
 
+# the stdio pipe transport reopens `/proc/self/fd` with `O_NONBLOCK`
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [features]
 default = ["base64", "macros", "server"]
 local = ["rmcp-macros?/local"]
@@ -173,7 +178,7 @@ transport-streamable-http-client-unix-socket = [
 ]
 
 transport-async-rw = ["tokio/io-util", "tokio-util/codec"]
-transport-io = ["transport-async-rw", "tokio/io-std"]
+transport-io = ["transport-async-rw", "tokio/io-std", "tokio/net"]
 transport-child-process = [
   "transport-async-rw",
   "tokio/process",
@@ -215,7 +220,10 @@ tracing-subscriber = { version = "0.3", features = [
   "fmt",
 ] }
 async-trait = "0.1"
-rstest = "0.26.1"
+rstest = "0.27.0"
+# Cargo unifies this feature into rmcp whenever any crate in a build enables it,
+# so the tests run with it on (see tests/test_deserialization.rs).
+serde_json = { version = "1.0", features = ["arbitrary_precision"] }
 [[test]]
 name = "test_tool_macros"
 required-features = ["server", "client"]
@@ -348,6 +356,23 @@ name = "test_streamable_http_4xx_error_body"
 required-features = ["transport-streamable-http-client", "transport-streamable-http-client-reqwest"]
 path = "tests/test_streamable_http_4xx_error_body.rs"
 
+[[test]]
+name = "test_streamable_http_malformed_json_request"
+required-features = [
+  "client",
+  "transport-streamable-http-client",
+  "transport-streamable-http-client-reqwest",
+]
+path = "tests/test_streamable_http_malformed_json_request.rs"
+
+[[test]]
+name = "test_streamable_http_initialize_error"
+required-features = [
+  "client",
+  "transport-streamable-http-client",
+  "transport-streamable-http-client-reqwest",
+]
+path = "tests/test_streamable_http_initialize_error.rs"
 
 [[test]]
 name = "test_custom_request"
@@ -358,6 +383,11 @@ path = "tests/test_custom_request.rs"
 name = "test_trace_context"
 required-features = ["server", "client"]
 path = "tests/test_trace_context.rs"
+
+[[test]]
+name = "test_abandoned_request_cancel"
+required-features = ["server", "client"]
+path = "tests/test_abandoned_request_cancel.rs"
 
 [[test]]
 name = "test_mrtr_behavior"

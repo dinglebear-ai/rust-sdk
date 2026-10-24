@@ -142,6 +142,14 @@ pub trait ServiceRole: std::fmt::Debug + Send + Sync + 'static + Copy + Clone {
     fn peer_cancelled_params(_notification: &Self::PeerNot) -> Option<&CancelledNotificationParam> {
         None
     }
+    #[doc(hidden)]
+    fn peer_cancels_subscriptions(_peer: &Peer<Self>) -> bool {
+        false
+    }
+    #[doc(hidden)]
+    fn is_subscription_request(_request: &Self::Req) -> bool {
+        false
+    }
     /// Invalidate any response cache affected by an inbound peer notification.
     ///
     /// The serve loop calls this for every notification *before* subscription
@@ -156,16 +164,13 @@ pub trait ServiceRole: std::fmt::Debug + Send + Sync + 'static + Copy + Clone {
         async {}
     }
 
+    /// Rejects outbound requests when the negotiated protocol forbids this role
+    /// from sending any.
     #[doc(hidden)]
-    fn enforce_request_association(
-        _request: &Self::Req,
-        _peer_info: Option<&Self::PeerInfo>,
-        _in_request_handler_scope: bool,
-    ) -> Result<(), ServiceError> {
+    fn enforce_outbound_request(_peer_info: Option<&Self::PeerInfo>) -> Result<(), ServiceError> {
         Ok(())
     }
 
-    /// Receive-side counterpart of [`Self::enforce_request_association`]:
     /// SEP-2260 says clients receiving a server-to-client request with no
     /// associated outbound request should reject it with invalid params. An
     /// error return is sent back to the peer instead of dispatching to the
@@ -199,17 +204,11 @@ pub enum PeerRequestAssociation {
     Unknown { has_pending_outbound_request: bool },
 }
 
-/// Whether `version` predates `2026-07-28`, the revision that replaced the
-/// `initialize` handshake with per-request metadata.
-pub(crate) fn is_legacy_version(version: &ProtocolVersion) -> bool {
-    version.as_str() < ProtocolVersion::V_2026_07_28.as_str()
-}
-
 pub(crate) fn uses_legacy_lifecycle(
     protocol_version: Option<&ProtocolVersion>,
     uses_discover_lifecycle: bool,
 ) -> bool {
-    !uses_discover_lifecycle && protocol_version.is_none_or(is_legacy_version)
+    !uses_discover_lifecycle && protocol_version.is_none_or(ProtocolVersion::has_initialize)
 }
 
 pub(crate) fn peer_request_association<Req: crate::model::GetExtensions, V>(
@@ -235,10 +234,6 @@ tokio::task_local! {
     pub(crate) static ORIGINATING_REQUEST: RequestId;
 }
 
-pub(crate) fn in_request_handler_scope() -> bool {
-    ORIGINATING_REQUEST.try_with(|_| ()).is_ok()
-}
-
 /// Marker in an outbound request's non-serialized [`Extensions`] identifying
 /// the in-flight peer request it was issued from (SEP-2260). Attached for both
 /// roles whenever a request is sent from within a request handler; the
@@ -246,14 +241,8 @@ pub(crate) fn in_request_handler_scope() -> bool {
 /// originating request's SSE stream. Never on the wire (SEP-2260 defines no
 /// wire field), so session managers that serialize messages between processes
 /// lose it and such requests fall back to the standalone stream with a warning.
-///
-/// # Caller requirements
-///
-/// From protocol version `2026-07-28`, server-to-client sampling, roots, and
-/// elicitation requests must be issued while handling a client request;
-/// outside a handler they return an `invalid_request` error. The association
-/// is task-local and does not cross `tokio::spawn`, so use the task manager
-/// for long-running work.
+/// The association is task-local and does not cross `tokio::spawn`, so use the
+/// task manager for long-running work.
 ///
 /// The client receive-side mirror is [`InboundStreamOrigin`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -471,7 +460,7 @@ impl<R: ServiceRole, S: Service<R>> DynService<R> for S {
 }
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     ops::Deref,
     sync::{Arc, atomic::AtomicU64},
     time::Duration,
@@ -551,6 +540,10 @@ impl ProgressNotificationToken for ServerNotification {
 }
 
 type Responder<T> = tokio::sync::oneshot::Sender<T>;
+struct PendingResponse<T> {
+    responder: T,
+    is_subscription: bool,
+}
 type ProgressTimeoutWatchers = Arc<tokio::sync::RwLock<HashMap<ProgressToken, mpsc::Sender<()>>>>;
 type SubscriptionChannel<N> = (mpsc::Sender<N>, usize);
 type SubscriptionChannelMap<N> = HashMap<RequestId, SubscriptionChannel<N>>;
@@ -1001,11 +994,7 @@ impl<R: ServiceRole> Peer<R> {
         subscription_sender: Option<SubscriptionChannel<R::PeerNot>>,
         wrap_responder: impl FnOnce(Responder<Result<T, ServiceError>>) -> PendingResponder<R>,
     ) -> Result<RequestHandle<R, T>, ServiceError> {
-        R::enforce_request_association(
-            &request,
-            self.peer_info().as_deref(),
-            in_request_handler_scope(),
-        )?;
+        R::enforce_outbound_request(self.peer_info().as_deref())?;
         if let Ok(originating) = ORIGINATING_REQUEST.try_with(|id| id.clone()) {
             request
                 .extensions_mut()
@@ -1164,16 +1153,19 @@ impl<R: ServiceRole> Peer<R> {
         *self.info.write().expect("peer info lock poisoned") = Some(Arc::new(info));
     }
 
+    #[cfg(feature = "client")]
     pub(crate) fn set_client_request_metadata(&self, metadata: ClientRequestMetadata) {
         let result = self.client_request_metadata.set(metadata);
         debug_assert!(result.is_ok(), "client request metadata set more than once");
     }
 
+    #[cfg(feature = "server")]
     pub(crate) fn require_request_metadata(&self) {
         self.request_metadata_required
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
+    #[cfg(feature = "server")]
     pub(crate) fn request_metadata_required(&self) -> bool {
         self.request_metadata_required
             .load(std::sync::atomic::Ordering::Acquire)
@@ -1433,7 +1425,14 @@ where
 {
     let (peer, peer_rx) = Peer::new(Arc::new(AtomicU32RequestIdProvider::default()), peer_info);
     R::configure_direct_peer(&peer, &service.get_info());
-    serve_inner(service, transport.into_transport(), peer, peer_rx, ct)
+    serve_inner(
+        service,
+        transport.into_transport(),
+        peer,
+        peer_rx,
+        VecDeque::new(),
+        ct,
+    )
 }
 
 /// Spawn a task that may hold `!Send` state when the `local` feature is active.
@@ -1458,12 +1457,19 @@ where
     tokio::task::spawn_local(future)
 }
 
+/// Run the service loop over `transport`.
+///
+/// `initial_messages` are messages the caller already read from `transport`
+/// (e.g. the first request of an `initialize`-less session). They are
+/// dispatched by the loop, in order, before anything else is read from the
+/// transport, so that their handlers run with the loop draining `peer_rx`.
 #[instrument(skip_all)]
 fn serve_inner<R, S, T>(
     service: S,
     transport: T,
     peer: Peer<R>,
     mut peer_rx: tokio::sync::mpsc::Receiver<PeerSinkMessage<R>>,
+    initial_messages: VecDeque<RxJsonRpcMessage<R>>,
     ct: CancellationToken,
 ) -> RunningService<R, S>
 where
@@ -1482,7 +1488,8 @@ where
         tracing::info!(?peer_info, "Service initialized as server");
     }
 
-    let mut local_responder_pool = HashMap::<RequestId, PendingResponder<R>>::new();
+    let mut local_responder_pool =
+        HashMap::<RequestId, PendingResponse<PendingResponder<R>>>::new();
     let mut local_ct_pool = HashMap::<RequestId, CancellationToken>::new();
     let shared_service = Arc::new(service);
     // for return
@@ -1495,6 +1502,7 @@ where
     let current_span = tracing::Span::current();
     let handle = spawn_service_task(async move {
         let mut transport = transport.into_transport();
+        let mut batch_messages = initial_messages;
         let mut send_task_set = tokio::task::JoinSet::<SendTaskResult>::new();
         let mut response_send_tasks = tokio::task::JoinSet::<()>::new();
         #[derive(Debug)]
@@ -1520,7 +1528,9 @@ where
         }
 
         let quit_reason = loop {
-            let evt = tokio::select! {
+            let evt = if let Some(message) = batch_messages.pop_front() {
+                Event::LegacyPeerMessage(message)
+            } else { tokio::select! {
                     m = sink_proxy_rx.recv(), if !sink_proxy_rx.is_closed() => {
                         if let Some(m) = m {
                             Event::ToSink(m)
@@ -1574,7 +1584,8 @@ where
                         tracing::info!("task cancelled");
                         break QuitReason::Cancelled
                     }
-                };
+                }
+            };
 
             let evt = match evt {
                 Event::LegacyPeerMessage(JsonRpcMessage::Response(JsonRpcResponse {
@@ -1585,7 +1596,7 @@ where
                     if let Some(responder) =
                         remove_pending_request(&mut local_responder_pool, &id)
                     {
-                        responder.send_standard_result(result);
+                        responder.responder.send_standard_result(result);
                     }
                     continue;
                 }
@@ -1606,7 +1617,7 @@ where
                 Event::SendTaskResult(SendTaskResult::Request { id, result }) => {
                     if let Err(e) = result
                         && let Some(responder) = local_responder_pool.remove(&id) {
-                            responder.send_error(ServiceError::TransportSend(e));
+                            responder.responder.send_error(ServiceError::TransportSend(e));
                         }
                 }
                 Event::SendTaskResult(SendTaskResult::Notification {
@@ -1624,7 +1635,7 @@ where
                         && let Some(request_id) = &param.request_id
                             && let Some(responder) = local_responder_pool.remove(request_id) {
                                 tracing::info!(id = %request_id, reason = param.reason, "cancelled");
-                                responder.send_error(ServiceError::Cancelled {
+                                responder.responder.send_error(ServiceError::Cancelled {
                                     reason: param.reason.clone(),
                                 });
                             }
@@ -1665,7 +1676,10 @@ where
                         responder.send_error(ServiceError::RawResponseUnavailable);
                         continue;
                     }
-                    local_responder_pool.insert(id.clone(), responder);
+                    local_responder_pool.insert(id.clone(), PendingResponse {
+                        responder,
+                        is_subscription: R::is_subscription_request(&request),
+                    });
                     let send = transport.send(JsonRpcMessage::request(request, id.clone()));
                     {
                         let id = id.clone();
@@ -1766,31 +1780,38 @@ where
                 })) => {
                     tracing::info!(?notification, "received notification");
                     R::invalidate_response_cache(&peer, &notification).await;
-                    let cancellation_request_id =
+                    let subscription_id =
                         if let Some(cancelled) = R::peer_cancelled_params(&notification) {
                             let request_id = cancelled.request_id.clone();
-                            if let Some(request_id) = request_id.as_ref() {
-                                if R::IS_CLIENT {
-                                    if let Some(responder) =
-                                        local_responder_pool.remove(request_id)
+                            // Modern servers cancel listen requests; legacy peers cancel
+                            // requests they originated, even when both directions share an ID.
+                            if R::peer_cancels_subscriptions(&peer) {
+                                if let Some(request_id) = request_id.as_ref() {
+                                    if local_responder_pool.get(request_id)
+                                        .is_some_and(|pending| pending.is_subscription)
+                                        && let Some(pending) = local_responder_pool.remove(request_id)
                                     {
-                                        responder.send_error(ServiceError::Cancelled {
+                                        pending.responder.send_error(ServiceError::Cancelled {
                                             reason: cancelled.reason.clone(),
                                         });
+                                    } else {
+                                        tracing::debug!(%request_id, "ignoring cancellation of unknown subscription");
+                                        continue;
                                     }
-                                } else if let Some(ct) = local_ct_pool.remove(request_id) {
+                                }
+                                request_id
+                            } else {
+                                if let Some(request_id) = request_id.as_ref()
+                                    && let Some(ct) = local_ct_pool.remove(request_id)
+                                {
                                     tracing::info!(id = %request_id, reason = cancelled.reason, "cancelled");
                                     ct.cancel();
                                 }
+                                None
                             }
-                            request_id
                         } else {
-                            None
+                            notification.get_meta().subscription_id()
                         };
-                    let subscription_id = notification
-                        .get_meta()
-                        .subscription_id()
-                        .or(cancellation_request_id);
                     if let Some(subscription_id) = subscription_id
                         && let Some((sender, capacity)) =
                             peer.subscription_sender(&subscription_id)
@@ -1807,7 +1828,7 @@ where
                                     && let Some(responder) =
                                         local_responder_pool.remove(&subscription_id)
                                 {
-                                    responder.send_error(ServiceError::SubscriptionLagged { capacity });
+                                    responder.responder.send_error(ServiceError::SubscriptionLagged { capacity });
                                 }
                                 peer.unregister_subscription(&subscription_id);
                                 peer.try_cancel_request(
@@ -1858,7 +1879,7 @@ where
                     if let Some(responder) =
                         remove_pending_request(&mut local_responder_pool, &id)
                     {
-                        responder.send_result(result);
+                        responder.responder.send_result(result);
                     }
                 }
                 Event::PeerMessage(JsonRpcMessage::Error(JsonRpcError { error, id, .. })) => {
@@ -1876,7 +1897,7 @@ where
                         } else {
                             ServiceError::McpError(error)
                         };
-                        responder.send_error(service_error);
+                        responder.responder.send_error(service_error);
                     }
                 }
                 Event::LegacyPeerMessage(_) => unreachable!("legacy messages are normalized above"),
@@ -1908,6 +1929,17 @@ where
                 // Then drain any handler responses still in the channel
                 // (handlers that finished after the loop broke).
                 while let Some(m) = sink_proxy_rx.recv().await {
+                    if let Some(id) = match &m {
+                        JsonRpcMessage::Response(response) => Some(&response.id),
+                        JsonRpcMessage::Error(error) => error.id.as_ref(),
+                        _ => None,
+                    } {
+                        let Some(ct) = local_ct_pool.remove(id) else {
+                            tracing::debug!(%id, "dropping response for cancelled request");
+                            continue;
+                        };
+                        ct.cancel();
+                    }
                     if let Err(error) = transport.send(m).await {
                         tracing::error!(%error, "failed to send pending response during drain");
                         break;
@@ -1919,6 +1951,10 @@ where
                 tracing::warn!("timed out draining in-flight responses");
             }
         }
+
+        // Preserve the response drain above, then cancel any handlers still running.
+        // EOF does not cancel the externally supplied service token.
+        serve_loop_ct.cancel();
 
         let sink_close_result = transport.close().await;
         if let Err(e) = sink_close_result {

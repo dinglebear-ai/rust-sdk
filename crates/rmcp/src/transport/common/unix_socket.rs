@@ -353,13 +353,23 @@ impl StreamableHttpClient for UnixSocketHttpClient {
                 match serde_json::from_slice::<crate::service::RawRxJsonRpcMessage<crate::RoleClient>>(
                     &body,
                 ) {
-                    Ok(message) => Ok(StreamableHttpPostResponse::RawJson(message, session_id)),
-                    Err(e) => {
+                    Ok(parsed) => Ok(StreamableHttpPostResponse::RawJson(parsed, session_id)),
+                    Err(e)
+                        if matches!(
+                            message,
+                            ClientJsonRpcMessage::Notification(_)
+                                | ClientJsonRpcMessage::Response(_)
+                                | ClientJsonRpcMessage::Error(_)
+                        ) =>
+                    {
                         tracing::warn!(
                             "could not parse JSON response as ServerJsonRpcMessage, treating as accepted: {e}"
                         );
                         Ok(StreamableHttpPostResponse::Accepted)
                     }
+                    Err(e) => Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
+                        json_rpc_parse_error_message(&e, &body),
+                    ))),
                 }
             }
             _ => Err(StreamableHttpError::UnexpectedContentType(
