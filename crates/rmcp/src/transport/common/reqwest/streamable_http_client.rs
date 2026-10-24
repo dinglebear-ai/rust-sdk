@@ -822,7 +822,7 @@ mod tests {
         server.abort();
 
         assert!(
-            matches!(result, Ok(StreamableHttpPostResponse::Json(..))),
+            matches!(result, Ok(StreamableHttpPostResponse::RawJson(..))),
             "same-origin {status} should be followed, got {result:?}"
         );
         let captured = captured.lock().await;
