@@ -2,18 +2,20 @@
 //!
 //! Keep one key for the entire token lifetime. This API deliberately does not
 //! persist tokens: persisting a token without its private key breaks binding.
-use super::{OAuthHttpClient, OAuthHttpClientFuture, OAuthHttpRedirectPolicy, OAuthHttpRequest};
+use std::{
+    fmt,
+    sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
 use aws_lc_rs::{
     rand::SystemRandom,
     signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair},
 };
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use sha2::{Digest, Sha256};
-use std::{
-    fmt,
-    sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
-};
+
+use super::{OAuthHttpClient, OAuthHttpClientFuture, OAuthHttpRedirectPolicy, OAuthHttpRequest};
 
 /// A sanitized DPoP error; never contains proofs, tokens, nonces or HTTP bodies.
 #[derive(Debug, thiserror::Error)]

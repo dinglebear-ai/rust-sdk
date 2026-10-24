@@ -1,6 +1,8 @@
-use super::*;
-use oauth2::HttpResponse;
 use std::collections::VecDeque;
+
+use oauth2::HttpResponse;
+
+use super::*;
 fn claims(proof: &str) -> serde_json::Value {
     serde_json::from_slice(
         &BASE64_URL_SAFE_NO_PAD
