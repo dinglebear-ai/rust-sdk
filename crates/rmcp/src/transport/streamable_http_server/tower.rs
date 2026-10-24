@@ -120,9 +120,8 @@ pub struct StreamableHttpServerConfig {
     /// - `:*` matches any port.
     /// - An explicit port matches only that port. An `Origin` without a port
     ///   uses the scheme default (443 for `https`, 80 for `http`).
-    /// - An entry without a port currently matches any port. This is
-    ///   deprecated: a future release will match only the scheme default
-    ///   port. Use `:*` or an explicit port instead.
+    /// - An entry without a port matches only the scheme default port.
+    ///   Use `:*` to allow any port explicitly.
     ///
     /// Call [`StreamableHttpServerConfig::enforce_origin_validation`] to enable
     /// validation with an empty list, rejecting every present Origin value.
@@ -1095,22 +1094,6 @@ fn origin_is_allowed(origin: &NormalizedOrigin, allowed_origins: &[String]) -> b
         })
 }
 
-fn warn_on_portless_allowed_origins(allowed_origins: &[String]) {
-    for raw in allowed_origins {
-        if let Some(AllowedOrigin::Tuple {
-            port: AllowedPort::Unspecified,
-            ..
-        }) = parse_allowed_origin(raw)
-        {
-            tracing::warn!(
-                allowed_origin = raw.as_str(),
-                "allowed origin without a port matches any port; a future release will match \
-                 only the scheme default port. Use `:*` or an explicit port instead",
-            );
-        }
-    }
-}
-
 #[cfg(test)]
 mod parse_allowed_origin_tests {
     use super::*;
@@ -1427,7 +1410,6 @@ where
         session_manager: Arc<M>,
         config: StreamableHttpServerConfig,
     ) -> Self {
-        warn_on_portless_allowed_origins(&config.allowed_origins);
         let pending_restores = config
             .session_store
             .is_some()
