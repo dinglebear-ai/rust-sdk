@@ -14,7 +14,10 @@ use rmcp::{
         auth::{
             AuthorizationCallback, AuthorizationRequest, ClientCredentialsConfig,
             InMemoryCredentialStore, JwtSigningAlgorithm, OAuthState, default_oauth_http_client,
-            enterprise::{EmaAuthorizationServer, EmaClientAuthentication, EmaExchangeRequest},
+            enterprise::{
+                EmaAuthorizationServer, EmaClientAuthentication, EmaExchangeRequest,
+                JwtBearerGrantRequest,
+            },
         },
         streamable_http_client::StreamableHttpClientTransportConfig,
     },
@@ -51,6 +54,10 @@ struct ConformanceContext {
     idp_client_secret: Option<String>,
     #[serde(default)]
     idp_refresh_token: Option<String>,
+    #[serde(default)]
+    idp_id_token: Option<String>,
+    #[serde(default)]
+    valid_jwt: Option<String>,
     #[serde(default)]
     idp_issuer: Option<String>,
     #[serde(default)]
@@ -779,7 +786,7 @@ async fn run_client_credentials_jwt(
     Ok(())
 }
 
-/// Exchange the fixture's IdP refresh token, then exercise authenticated MCP access.
+/// Exchange the fixture's approved IdP subject token, then access MCP.
 async fn run_ema_refresh_token_client(
     server_url: &str,
     ctx: &ConformanceContext,
@@ -794,14 +801,13 @@ async fn run_ema_refresh_token_client(
         ctx.idp_client_id
             .as_deref()
             .context("Missing idp_client_id")?,
-    )
-    .with_client_authentication(EmaClientAuthentication::ClientSecretBasic(
-        ClientSecret::new(
-            ctx.idp_client_secret
-                .clone()
-                .context("Missing idp_client_secret")?,
-        ),
-    ));
+    );
+    let idp = match &ctx.idp_client_secret {
+        Some(secret) => idp.with_client_authentication(EmaClientAuthentication::ClientSecretBasic(
+            ClientSecret::new(secret.clone()),
+        )),
+        None => idp,
+    };
     let resource_as = EmaAuthorizationServer::new(
         metadata
             .issuer
@@ -812,16 +818,24 @@ async fn run_ema_refresh_token_client(
     .with_client_authentication(EmaClientAuthentication::ClientSecretBasic(
         ClientSecret::new(ctx.client_secret.clone().context("Missing client_secret")?),
     ));
-    let refresh_token = RefreshToken::new(
-        ctx.idp_refresh_token
-            .clone()
-            .context("Missing idp_refresh_token")?,
-    );
     let http = default_oauth_http_client()?;
-    let token = EmaExchangeRequest::new(idp, resource_as, server_url, &refresh_token)
-        .with_scopes(manager.select_scopes(None, &[]))
-        .exchange(&http, &http)
-        .await?;
+    let scopes = manager.select_scopes(None, &[]);
+    let token = if let Some(id_token) = &ctx.idp_id_token {
+        EmaExchangeRequest::new_with_id_token(idp, resource_as, server_url, id_token)
+            .with_scopes(scopes)
+            .exchange(&http, &http)
+            .await?
+    } else {
+        let refresh_token = RefreshToken::new(
+            ctx.idp_refresh_token
+                .clone()
+                .context("Missing idp_refresh_token")?,
+        );
+        EmaExchangeRequest::new(idp, resource_as, server_url, &refresh_token)
+            .with_scopes(scopes)
+            .exchange(&http, &http)
+            .await?
+    };
 
     let transport = StreamableHttpClientTransport::from_config(
         StreamableHttpClientTransportConfig::with_uri(server_url)
@@ -835,6 +849,38 @@ async fn run_ema_refresh_token_client(
         let args = build_tool_arguments(&tool);
         client.call_tool(call_tool_params(tool.name, args)).await?;
     }
+    client.cancel().await?;
+    Ok(())
+}
+
+/// Exercise the same one-shot externally issued JWT grant available to production clients.
+async fn run_wif_client(server_url: &str, ctx: &ConformanceContext) -> anyhow::Result<()> {
+    let manager = AuthorizationManager::new(server_url).await?;
+    let metadata = manager.resolve_metadata().await?.metadata;
+    let server = EmaAuthorizationServer::new(
+        metadata
+            .issuer
+            .context("Missing authorization server issuer")?,
+        metadata.token_endpoint,
+        ctx.client_id.as_deref().context("Missing client_id")?,
+    );
+    let http = default_oauth_http_client()?;
+    let token = JwtBearerGrantRequest::new(
+        server,
+        server_url,
+        ctx.valid_jwt.as_deref().context("Missing valid_jwt")?,
+    )
+    .with_scopes(manager.select_scopes(None, &[]))
+    .exchange(&http)
+    .await?;
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(server_url)
+            .auth_header(token.access_token.secret()),
+    );
+    let client = BasicClientHandler
+        .serve_with_lifecycle(transport, conformance_lifecycle())
+        .await?;
+    client.list_tools(Default::default()).await?;
     client.cancel().await?;
     Ok(())
 }
@@ -1224,9 +1270,12 @@ async fn run_scenario(
         "auth/client-credentials-jwt" => run_client_credentials_jwt(server_url, ctx).await?,
 
         // Auth - enterprise-managed authorization with a refresh-token subject
-        "auth/enterprise-managed-authorization-refresh-token" => {
+        "auth/enterprise-managed-authorization"
+        | "auth/enterprise-managed-authorization-refresh-token" => {
             run_ema_refresh_token_client(server_url, ctx).await?
         }
+
+        "auth/wif-jwt-bearer" => run_wif_client(server_url, ctx).await?,
 
         // Auth - cross-app access
         "auth/cross-app-access-complete-flow" => {

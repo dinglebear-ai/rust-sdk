@@ -393,14 +393,102 @@ impl EmaIdJag {
     }
 }
 
+/// One RFC 7523 workload JWT-bearer grant using an externally issued assertion.
+///
+/// The caller approves the discovered server, resource and registration and obtains
+/// a fresh audience-bound workload assertion from its identity provider. This helper
+/// never signs workload identities, retries rejected grants, follows redirects, or
+/// falls back to another grant. It consumes the assertion on success or failure.
+/// Available with `auth-enterprise-managed`, alongside the other JWT-bearer exchanges.
+pub struct JwtBearerGrantRequest {
+    server: EmaAuthorizationServer,
+    resource: String,
+    assertion: String,
+    scopes: Vec<String>,
+}
+
+impl std::fmt::Debug for JwtBearerGrantRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("JwtBearerGrantRequest { .. }")
+    }
+}
+
+impl JwtBearerGrantRequest {
+    /// Bind an externally issued workload assertion to the approved MCP resource.
+    pub fn new(
+        server: EmaAuthorizationServer,
+        resource: impl Into<String>,
+        assertion: impl Into<String>,
+    ) -> Self {
+        Self {
+            server,
+            resource: resource.into(),
+            assertion: assertion.into(),
+            scopes: Vec::new(),
+        }
+    }
+
+    /// Request distinct non-empty scope tokens. Empty scopes omit the parameter.
+    pub fn with_scopes<I, S>(mut self, scopes: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.scopes = scopes.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Exchange once. Rejections retain their sanitized OAuth code for caller policy.
+    pub async fn exchange(self, http: &dyn OAuthHttpClient) -> Result<EmaAccessToken, EmaError> {
+        for endpoint in [
+            &self.server.issuer,
+            &self.server.token_endpoint,
+            &self.resource,
+        ] {
+            validate_endpoint(endpoint)?;
+        }
+        self.server.client_authentication.validate()?;
+        if self.server.client_id.trim().is_empty() || self.assertion.trim().is_empty() {
+            return Err(EmaError::InvalidRequest(
+                "client ID and workload assertion must not be empty",
+            ));
+        }
+        let scopes: HashSet<_> = self.scopes.iter().map(String::as_str).collect();
+        if scopes.len() != self.scopes.len() || self.scopes.iter().any(|s| !is_scope_token(s)) {
+            return Err(EmaError::InvalidRequest(
+                "scopes must be distinct non-empty tokens",
+            ));
+        }
+        let scope = self.scopes.join(" ");
+        let mut params = vec![
+            ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
+            ("assertion", self.assertion.as_str()),
+            ("resource", self.resource.as_str()),
+        ];
+        if !scope.is_empty() {
+            params.push(("scope", scope.as_str()));
+        }
+        let token: ResourceTokenResponse = post_form(
+            http,
+            &self.server,
+            &params,
+            EmaExchangeStage::ResourceAuthorizationServer,
+            None,
+            unix_time,
+        )
+        .await?;
+        token.validate(&self.resource, self.scopes.into_iter().collect())
+    }
+}
+
 /// A resource-bound bearer with secret-safe diagnostics and its optional lifetime.
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct EmaAccessToken {
     pub access_token: AccessToken,
     pub expires_in: Option<Duration>,
-    /// Resource-AS scopes, or the ID-JAG scopes when the response omits `scope`.
-    /// Empty when both the ID-JAG and response omit scopes.
+    /// Resource-AS scopes, or the authorized request scopes when `scope` is omitted.
+    /// For EMA those scopes come from the ID-JAG; for workload grants they are requested.
     pub scopes: HashSet<String>,
 }
 
@@ -785,7 +873,7 @@ impl ResourceTokenResponse {
             let scopes =
                 parse_scope(scope).ok_or_else(|| invalid("malformed or duplicate scopes"))?;
             if !scopes.iter().all(|s| granted.contains(*s)) {
-                return Err(invalid("access token scope exceeds ID-JAG scope"));
+                return Err(invalid("access token scope exceeds authorized scope"));
             }
             scopes.into_iter().map(str::to_owned).collect()
         } else {
