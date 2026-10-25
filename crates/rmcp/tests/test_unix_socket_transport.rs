@@ -483,3 +483,160 @@ async fn test_unix_socket_request_malformed_json_is_unexpected() -> anyhow::Resu
     }
     Ok(())
 }
+
+/// Repeated challenge fields are one ordered challenge list; later Bearer
+/// challenges must remain available to consent policy after a Basic challenge.
+#[tokio::test]
+async fn unix_auth_errors_retain_all_challenges_for_get_and_post() -> anyhow::Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for status in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
+        for get in [false, true] {
+            let dir = TemporarySocketDirectory::new()?;
+            let socket = dir.0.join("challenges.sock");
+            let hits = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&hits);
+            let app = Router::new().route(
+                "/mcp",
+                axum::routing::any(move || {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        let mut response = status.into_response();
+                        response.headers_mut().append(
+                            http::header::WWW_AUTHENTICATE,
+                            HeaderValue::from_static("Basic realm=\"local, proxy\""),
+                        );
+                        response.headers_mut().append(
+                            http::header::WWW_AUTHENTICATE,
+                            HeaderValue::from_static(
+                                "Bearer error=\"insufficient_scope\", scope=\"files:write\"",
+                            ),
+                        );
+                        response
+                    }
+                }),
+            );
+            let listener = tokio::net::UnixListener::bind(&socket)?;
+            let _server = AbortServerOnDrop(spawn_unix_server(listener, app));
+            let client =
+                UnixSocketHttpClient::new(socket.to_str().unwrap(), "http://local.test/mcp");
+            let challenge = if get {
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    client.get_stream("/mcp".into(), None, None, None, HashMap::new()),
+                )
+                .await?;
+                match result {
+                    Err(StreamableHttpError::AuthRequired(error)) => error.www_authenticate_header,
+                    Err(StreamableHttpError::InsufficientScope(error)) => {
+                        error.www_authenticate_header
+                    }
+                    _ => panic!("expected typed authentication challenge from GET"),
+                }
+            } else {
+                let message =
+                    serde_json::from_value(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))?;
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    client.post_message("/mcp".into(), message, None, None, HashMap::new()),
+                )
+                .await?;
+                match result {
+                    Err(StreamableHttpError::AuthRequired(error)) => error.www_authenticate_header,
+                    Err(StreamableHttpError::InsufficientScope(error)) => {
+                        error.www_authenticate_header
+                    }
+                    _ => panic!("expected typed authentication challenge from POST"),
+                }
+            };
+            assert_eq!(
+                challenge,
+                "Basic realm=\"local, proxy\", Bearer error=\"insufficient_scope\", scope=\"files:write\"",
+                "all authentication challenges must survive transport classification"
+            );
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                1,
+                "classification must not replay the request"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The same challenge list must survive the reqwest-backed adapter as well.
+#[tokio::test]
+async fn http_auth_errors_retain_all_challenges_for_get_and_post() -> anyhow::Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for status in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
+        for get in [false, true] {
+            let hits = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&hits);
+            let app = Router::new().route(
+                "/mcp",
+                axum::routing::any(move || {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        let mut response = status.into_response();
+                        response.headers_mut().append(
+                            http::header::WWW_AUTHENTICATE,
+                            HeaderValue::from_static("Basic realm=\"local, proxy\""),
+                        );
+                        response.headers_mut().append(
+                            http::header::WWW_AUTHENTICATE,
+                            HeaderValue::from_static(
+                                "Bearer error=\"insufficient_scope\", scope=\"files:write\"",
+                            ),
+                        );
+                        response
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let uri: Arc<str> = format!("http://{}/mcp", listener.local_addr()?).into();
+            let _server = AbortServerOnDrop(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            }));
+            let client = reqwest::Client::new();
+            let challenge = if get {
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    client.get_stream(uri, None, None, None, HashMap::new()),
+                )
+                .await?;
+                match result {
+                    Err(StreamableHttpError::AuthRequired(error)) => error.www_authenticate_header,
+                    Err(StreamableHttpError::InsufficientScope(error)) => {
+                        error.www_authenticate_header
+                    }
+                    _ => panic!("expected typed authentication challenge from GET"),
+                }
+            } else {
+                let message =
+                    serde_json::from_value(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))?;
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    client.post_message(uri, message, None, None, HashMap::new()),
+                )
+                .await?;
+                match result {
+                    Err(StreamableHttpError::AuthRequired(error)) => error.www_authenticate_header,
+                    Err(StreamableHttpError::InsufficientScope(error)) => {
+                        error.www_authenticate_header
+                    }
+                    _ => panic!("expected typed authentication challenge from POST"),
+                }
+            };
+            assert_eq!(
+                challenge,
+                "Basic realm=\"local, proxy\", Bearer error=\"insufficient_scope\", scope=\"files:write\"",
+                "all authentication challenges must survive transport classification"
+            );
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                1,
+                "classification must not replay the request"
+            );
+        }
+    }
+    Ok(())
+}

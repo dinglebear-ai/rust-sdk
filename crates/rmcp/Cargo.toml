@@ -19,6 +19,7 @@ exhaustive_enums = "warn"
 features = [
   "auth",
   "auth-client-credentials-jwt",
+  "auth-dpop",
   "auth-enterprise-managed",
   "base64",
   "client",
@@ -60,6 +61,8 @@ pin-project-lite = "0.2"
 pastey = { version = "0.2.0", optional = true }
 # oauth2 support
 oauth2 = { version = "5.0", optional = true, default-features = false }
+aws-lc-rs = { version = "1", optional = true }
+
 # JWT signing for client credentials (private_key_jwt)
 jsonwebtoken = { version = "11", optional = true, features = ["aws_lc_rs"] }
 
@@ -203,6 +206,7 @@ tower = ["dep:tower-service"]
 auth = ["dep:async-trait", "dep:oauth2", "__reqwest", "dep:url"]
 auth-client-credentials-jwt = ["auth", "dep:jsonwebtoken", "uuid"]
 auth-enterprise-managed = ["auth", "base64"]
+auth-dpop = ["auth", "base64", "dep:sha2", "dep:aws-lc-rs", "transport-streamable-http-client-reqwest"]
 schemars = ["dep:schemars"]
 
 [dev-dependencies]

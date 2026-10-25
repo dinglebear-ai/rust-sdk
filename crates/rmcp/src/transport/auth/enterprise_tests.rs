@@ -1169,3 +1169,109 @@ fn client_authentication_debug_output_redacts_credentials_and_provider_state() {
         assert!(!format!("{server:?} {request:?}").contains("private-query"));
     }
 }
+
+#[tokio::test]
+async fn workload_jwt_grant_sends_bound_assertion_once() {
+    let http = MockHttp::new(
+        200,
+        json!({"access_token":"workload-token","token_type":"Bearer","expires_in":120,"scope":"files.read"}),
+    );
+    let request = JwtBearerGrantRequest::new(
+        EmaAuthorizationServer::new(AS, AS_TOKEN, "workload"),
+        RESOURCE,
+        "external-assertion",
+    )
+    .with_scopes(["files.read"]);
+    assert!(!format!("{request:?}").contains("external-assertion"));
+    let token = request.exchange(&http).await.unwrap();
+    assert_eq!(token.access_token.secret(), "workload-token");
+    let requests = http.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].redirect_policy, OAuthHttpRedirectPolicy::Stop);
+    let params: BTreeMap<_, _> = url::form_urlencoded::parse(requests[0].request.body())
+        .into_owned()
+        .collect();
+    assert_eq!(
+        params["grant_type"],
+        "urn:ietf:params:oauth:grant-type:jwt-bearer"
+    );
+    assert_eq!(params["assertion"], "external-assertion");
+    assert_eq!(params["resource"], RESOURCE);
+    assert_eq!(params["scope"], "files.read");
+    assert_eq!(params["client_id"], "workload");
+    assert!(!params.contains_key("client_assertion"));
+}
+
+#[tokio::test]
+async fn workload_jwt_rejections_never_retry_or_fall_back() {
+    for code in ["invalid_grant", "invalid_scope", "unauthorized_client"] {
+        let http = MockHttp::new(
+            400,
+            json!({"error":code,"error_description":"secret-provider-detail"}),
+        );
+        let error = JwtBearerGrantRequest::new(
+            EmaAuthorizationServer::new(AS, AS_TOKEN, "workload"),
+            RESOURCE,
+            "external-assertion",
+        )
+        .exchange(&http)
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains(code));
+        assert!(!format!("{error:?}").contains("secret-provider-detail"));
+        assert_eq!(http.requests.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn workload_jwt_validates_before_sending_and_checks_token_binding() {
+    let http = MockHttp::default();
+    let error = JwtBearerGrantRequest::new(
+        EmaAuthorizationServer::new(AS, "http://untrusted.example/token", "workload"),
+        RESOURCE,
+        "assertion",
+    )
+    .exchange(&http)
+    .await
+    .unwrap_err();
+    assert!(matches!(error, EmaError::InvalidRequest(_)));
+    assert!(http.requests.lock().unwrap().is_empty());
+    let http = MockHttp::new(
+        200,
+        json!({"access_token":"token","token_type":"Bearer","resource":"https://wrong.example"}),
+    );
+    assert!(matches!(
+        JwtBearerGrantRequest::new(
+            EmaAuthorizationServer::new(AS, AS_TOKEN, "workload"),
+            RESOURCE,
+            "assertion"
+        )
+        .exchange(&http)
+        .await,
+        Err(EmaError::InvalidResponse { .. })
+    ));
+}
+
+#[tokio::test]
+async fn workload_jwt_empty_identity_and_invalid_scopes_do_not_dispatch() {
+    for (client, assertion, scopes) in [
+        ("", "assertion", vec![]),
+        ("workload", " ", vec![]),
+        ("workload", "assertion", vec!["files.read", "files.read"]),
+        ("workload", "assertion", vec!["files\tread"]),
+    ] {
+        let http = MockHttp::default();
+        assert!(matches!(
+            JwtBearerGrantRequest::new(
+                EmaAuthorizationServer::new(AS, AS_TOKEN, client),
+                RESOURCE,
+                assertion
+            )
+            .with_scopes(scopes)
+            .exchange(&http)
+            .await,
+            Err(EmaError::InvalidRequest(_))
+        ));
+        assert!(http.requests.lock().unwrap().is_empty());
+    }
+}

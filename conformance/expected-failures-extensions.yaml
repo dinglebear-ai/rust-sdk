@@ -18,9 +18,5 @@
 # becomes active but does not pass.
 server: []
 
-client:
-  # Informational OAuth extension scenarios.
-  - auth/enterprise-managed-authorization
-  - auth/dpop
-  - auth/dpop-nonce
-  - auth/wif-jwt-bearer
+# Production OAuth extension scenarios all pass. Keep the baseline strict.
+client: []
