@@ -16,7 +16,7 @@ use crate::{
             client_side_sse::{DEFAULT_MAX_SSE_EVENT_SIZE, bounded_sse_stream},
             http_header::{
                 EVENT_STREAM_MIME_TYPE, HEADER_LAST_EVENT_ID, HEADER_SESSION_ID, JSON_MIME_TYPE,
-                extract_scope_from_header, validate_custom_header,
+                authentication_challenge_header, extract_scope_from_header, validate_custom_header,
             },
         },
         streamable_http_client::*,
@@ -260,34 +260,28 @@ impl StreamableHttpClient for UnixSocketHttpClient {
 
         let status = response.status();
 
-        if status == StatusCode::UNAUTHORIZED
-            && let Some(header) = response.headers().get(WWW_AUTHENTICATE)
-        {
-            let www_authenticate_header = header
-                .to_str()
+        if status == StatusCode::UNAUTHORIZED && response.headers().contains_key(WWW_AUTHENTICATE) {
+            let www_authenticate_header = authentication_challenge_header(response.headers())
                 .map_err(|_| {
                     StreamableHttpError::UnexpectedServerResponse(Cow::from(
                         "invalid www-authenticate header value",
                     ))
-                })?
-                .to_string();
+                })?;
             return Err(StreamableHttpError::AuthRequired(AuthRequiredError {
                 www_authenticate_header,
             }));
         }
 
-        if status == StatusCode::FORBIDDEN
-            && let Some(header) = response.headers().get(WWW_AUTHENTICATE)
-        {
-            let header_str = header.to_str().map_err(|_| {
+        if status == StatusCode::FORBIDDEN && response.headers().contains_key(WWW_AUTHENTICATE) {
+            let header_str = authentication_challenge_header(response.headers()).map_err(|_| {
                 StreamableHttpError::UnexpectedServerResponse(Cow::from(
                     "invalid www-authenticate header value",
                 ))
             })?;
-            let scope = extract_scope_from_header(header_str);
+            let scope = extract_scope_from_header(&header_str);
             return Err(StreamableHttpError::InsufficientScope(
                 InsufficientScopeError {
-                    www_authenticate_header: header_str.to_string(),
+                    www_authenticate_header: header_str,
                     required_scope: scope,
                 },
             ));
@@ -485,33 +479,31 @@ impl StreamableHttpClient for UnixSocketHttpClient {
         }
 
         if response.status() == StatusCode::UNAUTHORIZED
-            && let Some(header) = response.headers().get(WWW_AUTHENTICATE)
+            && response.headers().contains_key(WWW_AUTHENTICATE)
         {
-            let www_authenticate_header = header
-                .to_str()
+            let www_authenticate_header = authentication_challenge_header(response.headers())
                 .map_err(|_| {
                     StreamableHttpError::UnexpectedServerResponse(Cow::from(
                         "invalid www-authenticate header value",
                     ))
-                })?
-                .to_string();
+                })?;
             return Err(StreamableHttpError::AuthRequired(AuthRequiredError {
                 www_authenticate_header,
             }));
         }
 
         if response.status() == StatusCode::FORBIDDEN
-            && let Some(header) = response.headers().get(WWW_AUTHENTICATE)
+            && response.headers().contains_key(WWW_AUTHENTICATE)
         {
-            let header_str = header.to_str().map_err(|_| {
+            let header_str = authentication_challenge_header(response.headers()).map_err(|_| {
                 StreamableHttpError::UnexpectedServerResponse(Cow::from(
                     "invalid www-authenticate header value",
                 ))
             })?;
-            let scope = extract_scope_from_header(header_str);
+            let scope = extract_scope_from_header(&header_str);
             return Err(StreamableHttpError::InsufficientScope(
                 InsufficientScopeError {
-                    www_authenticate_header: header_str.to_string(),
+                    www_authenticate_header: header_str,
                     required_scope: scope,
                 },
             ));
