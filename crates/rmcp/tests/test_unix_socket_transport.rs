@@ -116,6 +116,32 @@ async fn mcp_handler(
 
 /// Spawns an HTTP/1.1 server on a Unix socket using hyper directly.
 /// Avoids `axum::serve(UnixListener, ...)` which uses `spawn_local` on Linux.
+struct TemporarySocketDirectory(std::path::PathBuf);
+
+impl TemporarySocketDirectory {
+    fn new() -> std::io::Result<Self> {
+        // Keep the pathname below the small sockaddr_un limit on macOS; its
+        // resolved system temporary directory can itself be very long.
+        let path = std::path::Path::new("/tmp").join(format!("rmcp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&path)?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for TemporarySocketDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+struct AbortServerOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortServerOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 fn spawn_unix_server(
     listener: tokio::net::UnixListener,
     app: Router,
