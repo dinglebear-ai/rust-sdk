@@ -89,6 +89,27 @@ async fn mcp_handler(
                 ],
                 String::new(),
             );
+        } else if method == "skills/list" {
+            let response = json!({
+                "jsonrpc": "2.0",
+                "id": json_body.get("id"),
+                "result": {
+                    "resultType": "complete",
+                    "skills": ["unix-example"],
+                    "_meta": {"vendorExtension": {"retained": true}}
+                }
+            });
+            return (
+                StatusCode::OK,
+                [
+                    (http::header::CONTENT_TYPE, "application/json"),
+                    (
+                        http::HeaderName::from_static("mcp-session-id"),
+                        "unix-test-session",
+                    ),
+                ],
+                response.to_string(),
+            );
         }
     }
 
@@ -114,8 +135,32 @@ async fn mcp_handler(
     )
 }
 
-/// Spawns an HTTP/1.1 server on a Unix socket using hyper directly.
-/// Avoids `axum::serve(UnixListener, ...)` which uses `spawn_local` on Linux.
+struct TemporarySocketDirectory(std::path::PathBuf);
+
+impl TemporarySocketDirectory {
+    fn new() -> std::io::Result<Self> {
+        // Keep the pathname below the small sockaddr_un limit on macOS; its
+        // resolved system temporary directory can itself be very long.
+        let path = std::path::Path::new("/tmp").join(format!("rmcp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&path)?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for TemporarySocketDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+struct AbortServerOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortServerOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 fn spawn_unix_server(
     listener: tokio::net::UnixListener,
     app: Router,
@@ -141,6 +186,134 @@ fn spawn_unix_server(
             });
         }
     })
+}
+
+/// A configured body cap must reject oversized buffered JSON responses before deserialization.
+#[tokio::test]
+async fn test_unix_socket_response_body_cap() -> anyhow::Result<()> {
+    let dir = TemporarySocketDirectory::new()?;
+    let socket_path = dir.0.join("mcp.sock");
+    let app = Router::new().route(
+        "/mcp",
+        post(|| async {
+            (
+                StatusCode::OK,
+                [(http::header::CONTENT_TYPE, "application/json")],
+                "x".repeat(1024),
+            )
+        }),
+    );
+    let listener = tokio::net::UnixListener::bind(&socket_path)?;
+    let _server_guard = AbortServerOnDrop(spawn_unix_server(listener, app));
+
+    let socket_str = socket_path.to_str().expect("UTF-8 temporary path");
+    let uri = "http://mcp-server.internal/mcp";
+    let client = UnixSocketHttpClient::new(socket_str, uri).with_max_response_bytes(128);
+    let transport = StreamableHttpClientTransport::with_client(
+        client,
+        StreamableHttpClientTransportConfig::with_uri("/mcp"),
+    );
+
+    let error = ().serve(transport).await.expect_err("oversized response must fail");
+    assert!(
+        error.to_string().contains("response_too_large"),
+        "unexpected error: {error}"
+    );
+    Ok(())
+}
+
+/// Large JSON responses remain bounded by the caller's explicit budget.
+#[tokio::test]
+async fn test_unix_socket_explicit_json_budget_can_exceed_default() -> anyhow::Result<()> {
+    let dir = TemporarySocketDirectory::new()?;
+    let socket_path = dir.0.join("mcp.sock");
+    let app = Router::new().route(
+        "/mcp",
+        post(|| async {
+            let mut body = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#.to_owned();
+            body.extend(std::iter::repeat_n(' ', 17 * 1024 * 1024));
+            (
+                StatusCode::OK,
+                [(http::header::CONTENT_TYPE, "application/json")],
+                body,
+            )
+        }),
+    );
+    let listener = tokio::net::UnixListener::bind(&socket_path)?;
+    let _server_guard = AbortServerOnDrop(spawn_unix_server(listener, app));
+    let uri = "http://localhost/mcp";
+    let client = UnixSocketHttpClient::new(socket_path.to_str().unwrap(), uri)
+        .with_max_response_bytes(24 * 1024 * 1024);
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.post_message(
+            Arc::from(uri),
+            ClientJsonRpcMessage::request(
+                ClientRequest::PingRequest(PingRequest::default()),
+                RequestId::Number(1),
+            ),
+            None,
+            None,
+            HashMap::new(),
+        ),
+    )
+    .await??;
+    assert!(response.expect_json::<std::io::Error>().is_ok());
+    Ok(())
+}
+
+/// A per-client cap cannot weaken the bounded error-body budget.
+#[tokio::test]
+async fn test_unix_socket_configured_cap_preserves_error_limit() -> anyhow::Result<()> {
+    for (status, content_type, max_size) in [
+        (StatusCode::BAD_REQUEST, "text/plain", 64 * 1024),
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "application/json",
+            64 * 1024,
+        ),
+    ] {
+        let dir = TemporarySocketDirectory::new()?;
+        let socket_path = dir.0.join("mcp.sock");
+        let app = Router::new().route(
+            "/mcp",
+            post(move || async move {
+                (
+                    status,
+                    [(http::header::CONTENT_TYPE, content_type)],
+                    "x".repeat(max_size + 1),
+                )
+            }),
+        );
+        let listener = tokio::net::UnixListener::bind(&socket_path)?;
+        let _server_guard = AbortServerOnDrop(spawn_unix_server(listener, app));
+        let uri = "http://localhost/mcp";
+        let client = UnixSocketHttpClient::new(socket_path.to_str().unwrap(), uri)
+            .with_max_response_bytes(max_size + 1024);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.post_message(
+                Arc::from(uri),
+                ClientJsonRpcMessage::request(
+                    ClientRequest::PingRequest(PingRequest::default()),
+                    RequestId::Number(1),
+                ),
+                None,
+                None,
+                HashMap::new(),
+            ),
+        )
+        .await?;
+        assert!(
+            matches!(
+                result,
+                Err(StreamableHttpError::ResponseBodyTooLarge { max_size: actual })
+                    if actual == max_size
+            ),
+            "configured cap weakened the upstream {content_type} bound: {result:?}"
+        );
+    }
+    Ok(())
 }
 
 /// Integration test: MCP client connects and completes handshake over a Unix domain socket.

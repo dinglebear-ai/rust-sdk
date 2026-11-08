@@ -37,6 +37,8 @@ pub enum UnixSocketError {
     Http(#[from] http::Error),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("response_too_large: received more than {max_bytes} bytes")]
+    ResponseTooLarge { max_bytes: usize },
 }
 
 impl From<UnixSocketError> for StreamableHttpError<UnixSocketError> {
@@ -69,6 +71,7 @@ impl From<UnixSocketError> for StreamableHttpError<UnixSocketError> {
 pub struct UnixSocketHttpClient {
     socket_path: Arc<str>,
     host_header: HeaderValue,
+    max_response_bytes: Option<usize>,
 }
 
 impl UnixSocketHttpClient {
@@ -100,7 +103,18 @@ impl UnixSocketHttpClient {
         Self {
             socket_path: resolve_socket_path(socket_path).into(),
             host_header,
+            max_response_bytes: None,
         }
+    }
+
+    /// Set an explicit maximum for buffered JSON response bodies.
+    ///
+    /// The default is 16 MiB. An explicit limit may be larger or smaller.
+    /// Error response bodies remain capped at 64 KiB or the tighter configured limit.
+    #[must_use]
+    pub fn with_max_response_bytes(mut self, max_response_bytes: usize) -> Self {
+        self.max_response_bytes = Some(max_response_bytes);
+        self
     }
 }
 
@@ -150,6 +164,30 @@ async fn send_http_request(
     });
 
     Ok(sender.send_request(request).await?)
+}
+
+async fn collect_response_body(
+    body: Incoming,
+    content_length: Option<u64>,
+    max_response_bytes: Option<usize>,
+    default_limit: usize,
+) -> Result<Bytes, StreamableHttpError<UnixSocketError>> {
+    let limit = max_response_bytes.map_or(default_limit, |max| max.min(default_limit));
+    read_bounded_body(
+        body.into_data_stream().map_err(UnixSocketError::Hyper),
+        content_length,
+        limit,
+    )
+    .await
+    .map(Bytes::from)
+    .map_err(|error| match (error, max_response_bytes) {
+        (StreamableHttpError::ResponseBodyTooLarge { .. }, Some(max_bytes))
+            if max_bytes <= default_limit =>
+        {
+            StreamableHttpError::Client(UnixSocketError::ResponseTooLarge { max_bytes })
+        }
+        (error, _) => error,
+    })
 }
 
 /// Applies custom headers to a request builder, rejecting reserved headers.
@@ -276,18 +314,23 @@ impl StreamableHttpClient for UnixSocketHttpClient {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok());
         if !status.is_success() {
-            let body = match read_bounded_body(
-                response
-                    .into_body()
-                    .into_data_stream()
-                    .map_err(UnixSocketError::Hyper),
+            let body = match collect_response_body(
+                response.into_body(),
                 content_length,
+                self.max_response_bytes,
                 MAX_ERROR_RESPONSE_SIZE,
             )
             .await
             {
                 Ok(body) => String::from_utf8_lossy(&body).into_owned(),
                 Err(error @ StreamableHttpError::ResponseBodyTooLarge { .. }) => return Err(error),
+                Err(
+                    error @ StreamableHttpError::Client(UnixSocketError::ResponseTooLarge {
+                        ..
+                    }),
+                ) => {
+                    return Err(error);
+                }
                 Err(_) => "<failed to read response body>".to_owned(),
             };
             if let Some(response) =
@@ -326,13 +369,11 @@ impl StreamableHttpClient for UnixSocketHttpClient {
                 Ok(StreamableHttpPostResponse::Sse(sse_stream, session_id))
             }
             Some(ref ct) if ct.as_bytes().starts_with(JSON_MIME_TYPE.as_bytes()) => {
-                let body = read_bounded_body(
-                    response
-                        .into_body()
-                        .into_data_stream()
-                        .map_err(UnixSocketError::Hyper),
+                let body = collect_response_body(
+                    response.into_body(),
                     content_length,
-                    MAX_JSON_RESPONSE_SIZE,
+                    self.max_response_bytes,
+                    self.max_response_bytes.unwrap_or(MAX_JSON_RESPONSE_SIZE),
                 )
                 .await?;
                 match serde_json::from_slice::<ServerJsonRpcMessage>(&body) {
