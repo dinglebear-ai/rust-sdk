@@ -10,7 +10,7 @@ use sse_stream::Sse;
 use tokio::net::UnixStream;
 
 use crate::{
-    model::ClientJsonRpcMessage,
+    model::{ClientJsonRpcMessage, ServerJsonRpcMessage},
     transport::{
         common::{
             client_side_http::{
@@ -107,7 +107,10 @@ impl UnixSocketHttpClient {
         }
     }
 
-    /// Limit buffered non-SSE response bodies read from the socket.
+    /// Set an explicit maximum for buffered JSON response bodies.
+    ///
+    /// The default is 16 MiB. An explicit limit may be larger or smaller.
+    /// Error response bodies remain capped at 64 KiB or the tighter configured limit.
     #[must_use]
     pub fn with_max_response_bytes(mut self, max_response_bytes: usize) -> Self {
         self.max_response_bytes = Some(max_response_bytes);
@@ -201,10 +204,6 @@ fn apply_custom_headers(
 
 impl StreamableHttpClient for UnixSocketHttpClient {
     type Error = UnixSocketError;
-
-    fn preserves_raw_responses() -> bool {
-        true
-    }
 
     async fn post_message(
         &self,
@@ -374,13 +373,11 @@ impl StreamableHttpClient for UnixSocketHttpClient {
                     response.into_body(),
                     content_length,
                     self.max_response_bytes,
-                    MAX_JSON_RESPONSE_SIZE,
+                    self.max_response_bytes.unwrap_or(MAX_JSON_RESPONSE_SIZE),
                 )
                 .await?;
-                match serde_json::from_slice::<crate::service::RawRxJsonRpcMessage<crate::RoleClient>>(
-                    &body,
-                ) {
-                    Ok(parsed) => Ok(StreamableHttpPostResponse::RawJson(parsed, session_id)),
+                match serde_json::from_slice::<ServerJsonRpcMessage>(&body) {
+                    Ok(parsed) => Ok(StreamableHttpPostResponse::Json(parsed, session_id)),
                     Err(e)
                         if matches!(
                             message,

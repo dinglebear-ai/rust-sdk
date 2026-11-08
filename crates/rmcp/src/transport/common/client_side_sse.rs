@@ -10,7 +10,7 @@ use futures::{Stream, StreamExt, stream::BoxStream};
 use sse_stream::{Error as SseError, Sse, SseStream};
 use thiserror::Error;
 
-use crate::{RoleClient, service::RawRxJsonRpcMessage};
+use crate::model::ServerJsonRpcMessage;
 
 pub type BoxedSseResponse = BoxStream<'static, Result<Sse, SseError>>;
 
@@ -396,7 +396,7 @@ impl<R> Stream for SseAutoReconnectStream<R>
 where
     R: SseStreamReconnect,
 {
-    type Item = Result<RawRxJsonRpcMessage<RoleClient>, R::Error>;
+    type Item = Result<ServerJsonRpcMessage, R::Error>;
     fn poll_next(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -431,8 +431,7 @@ where
                                 }
                             }
                             if let Some(data) = sse.data {
-                                match serde_json::from_str::<RawRxJsonRpcMessage<RoleClient>>(&data)
-                                {
+                                match serde_json::from_str::<ServerJsonRpcMessage>(&data) {
                                     Err(e) => {
                                         // Downgrade to debug to avoid noisy logs when servers emit
                                         // non-JSON payloads as message frames. Include last_event_id

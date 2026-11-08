@@ -68,10 +68,6 @@ fn http_status_error(status: StatusCode, headers: &HeaderMap) -> Option<HttpStat
 impl StreamableHttpClient for reqwest::Client {
     type Error = reqwest::Error;
 
-    fn preserves_raw_responses() -> bool {
-        true
-    }
-
     async fn get_stream(
         &self,
         uri: Arc<str>,
@@ -397,10 +393,8 @@ impl StreamableHttpClient for reqwest::Client {
                     MAX_JSON_RESPONSE_SIZE,
                 )
                 .await?;
-                match serde_json::from_slice::<crate::service::RawRxJsonRpcMessage<crate::RoleClient>>(
-                    &body,
-                ) {
-                    Ok(parsed) => Ok(StreamableHttpPostResponse::RawJson(parsed, session_id)),
+                match serde_json::from_slice::<ServerJsonRpcMessage>(&body) {
+                    Ok(parsed) => Ok(StreamableHttpPostResponse::Json(parsed, session_id)),
                     Err(e)
                         if matches!(
                             message,
@@ -940,7 +934,7 @@ mod tests {
         server.abort();
 
         assert!(
-            matches!(result, Ok(StreamableHttpPostResponse::RawJson(..))),
+            matches!(result, Ok(StreamableHttpPostResponse::Json(..))),
             "same-origin {status} should be followed, got {result:?}"
         );
         let captured = captured.lock().await;

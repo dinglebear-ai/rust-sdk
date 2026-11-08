@@ -241,6 +241,9 @@ pub struct ServerCapabilities {
     pub resources: Option<ResourcesCapability>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<ToolsCapability>,
+    /// MCP Events support. Method implementations and delivery are server-owned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub events: Option<JsonObject>,
 }
 
 impl ServerCapabilities {
@@ -395,12 +398,20 @@ builder! {
         prompts: PromptsCapability,
         resources: ResourcesCapability,
         tools: ToolsCapability,
+        events: JsonObject,
     }
 }
 
 #[cfg(any(feature = "server", feature = "macros"))]
-impl<const E: bool, const EXT: bool, const L: bool, const C: bool, const P: bool, const R: bool>
-    ServerCapabilitiesBuilder<ServerCapabilitiesBuilderState<E, EXT, L, C, P, R, true>>
+impl<
+    const E: bool,
+    const EXT: bool,
+    const L: bool,
+    const C: bool,
+    const P: bool,
+    const R: bool,
+    const EV: bool,
+> ServerCapabilitiesBuilder<ServerCapabilitiesBuilderState<E, EXT, L, C, P, R, true, EV>>
 {
     pub fn enable_tool_list_changed(mut self) -> Self {
         if let Some(c) = self.tools.as_mut() {
@@ -411,8 +422,15 @@ impl<const E: bool, const EXT: bool, const L: bool, const C: bool, const P: bool
 }
 
 #[cfg(any(feature = "server", feature = "macros"))]
-impl<const E: bool, const EXT: bool, const L: bool, const C: bool, const R: bool, const T: bool>
-    ServerCapabilitiesBuilder<ServerCapabilitiesBuilderState<E, EXT, L, C, true, R, T>>
+impl<
+    const E: bool,
+    const EXT: bool,
+    const L: bool,
+    const C: bool,
+    const R: bool,
+    const T: bool,
+    const EV: bool,
+> ServerCapabilitiesBuilder<ServerCapabilitiesBuilderState<E, EXT, L, C, true, R, T, EV>>
 {
     pub fn enable_prompts_list_changed(mut self) -> Self {
         if let Some(c) = self.prompts.as_mut() {
@@ -423,8 +441,15 @@ impl<const E: bool, const EXT: bool, const L: bool, const C: bool, const R: bool
 }
 
 #[cfg(any(feature = "server", feature = "macros"))]
-impl<const E: bool, const EXT: bool, const L: bool, const C: bool, const P: bool, const T: bool>
-    ServerCapabilitiesBuilder<ServerCapabilitiesBuilderState<E, EXT, L, C, P, true, T>>
+impl<
+    const E: bool,
+    const EXT: bool,
+    const L: bool,
+    const C: bool,
+    const P: bool,
+    const T: bool,
+    const EV: bool,
+> ServerCapabilitiesBuilder<ServerCapabilitiesBuilderState<E, EXT, L, C, P, true, T, EV>>
 {
     pub fn enable_resources_list_changed(mut self) -> Self {
         if let Some(c) = self.resources.as_mut() {

@@ -314,11 +314,8 @@ fn assert_outcome(result: PostResult, expected: Outcome) {
         }
         (
             Outcome::JsonResult,
-            Ok(StreamableHttpPostResponse::RawJson(JsonRpcMessage::Response(response), _)),
-        ) => {
-            assert_eq!(response.id, RequestId::Number(1));
-            assert_eq!(response.result, serde_json::json!({}));
-        }
+            Ok(StreamableHttpPostResponse::Json(JsonRpcMessage::Response(response), _)),
+        ) => assert_eq!(response.id, RequestId::Number(1)),
         (
             Outcome::JsonError(code),
             Ok(StreamableHttpPostResponse::Json(JsonRpcMessage::Error(error), _)),

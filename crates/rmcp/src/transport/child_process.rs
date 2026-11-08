@@ -4,9 +4,7 @@ use futures::future::Future;
 use process_wrap::tokio::{ChildWrapper, CommandWrap};
 use tokio::process::{ChildStderr, ChildStdin, ChildStdout};
 
-use super::{
-    RawRxJsonRpcMessage, RxJsonRpcMessage, Transport, TxJsonRpcMessage, async_rw::AsyncRwTransport,
-};
+use super::{RxJsonRpcMessage, Transport, TxJsonRpcMessage, async_rw::AsyncRwTransport};
 use crate::RoleClient;
 
 const MAX_WAIT_ON_DROP_SECS: u64 = 3;
@@ -194,10 +192,6 @@ impl TokioChildProcessBuilder {
 impl Transport<RoleClient> for TokioChildProcess {
     type Error = std::io::Error;
 
-    fn preserves_raw_responses() -> bool {
-        true
-    }
-
     fn send(
         &mut self,
         item: TxJsonRpcMessage<RoleClient>,
@@ -207,12 +201,6 @@ impl Transport<RoleClient> for TokioChildProcess {
 
     fn receive(&mut self) -> impl Future<Output = Option<RxJsonRpcMessage<RoleClient>>> + Send {
         self.transport.receive()
-    }
-
-    fn receive_raw(
-        &mut self,
-    ) -> impl Future<Output = Option<RawRxJsonRpcMessage<RoleClient>>> + Send {
-        self.transport.receive_raw()
     }
 
     fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
