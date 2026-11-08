@@ -36,7 +36,7 @@ async fn typed_extension_response_survives_child_process_and_preserves_correlati
 
     let response: SkillsListResult = client
         .send_request_as(ClientRequest::CustomRequest(CustomRequest::new(
-            "skills/list",
+            "example/skills/list",
             None,
         )))
         .await?;

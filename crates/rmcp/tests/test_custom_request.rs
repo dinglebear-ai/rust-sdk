@@ -24,6 +24,9 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 type CustomRequestPayload = (String, Option<serde_json::Value>);
 
+// Native skills/list is dispatched before on_custom_request as of SEP-2640.
+// Keep these fixtures in a vendor namespace to exercise arbitrary extension results.
+
 struct LegacyTypedTransport;
 
 impl Transport<RoleClient> for LegacyTypedTransport {
@@ -105,7 +108,7 @@ async fn legacy_transport_preserves_standard_response_without_raw_round_trip() -
 
     let typed = client
         .send_request_as::<SkillsListResult>(ClientRequest::CustomRequest(CustomRequest::new(
-            "skills/list",
+            "example/skills/list",
             None,
         )))
         .await;
@@ -218,21 +221,21 @@ impl ServerHandler for TypedCustomRequestServer {
         request: CustomRequest,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<CustomResult, rmcp::ErrorData> {
-        if request.method == "skills/malformed" {
+        if request.method == "example/skills/malformed" {
             return Ok(CustomResult::new(json!({
                 "resultType": "complete",
                 "skills": "not-an-array",
                 "_meta": {}
             })));
         }
-        if request.method == "skills/error" {
+        if request.method == "example/skills/error" {
             return Err(ErrorData::new(
                 ErrorCode::INVALID_PARAMS,
                 "invalid skills request",
                 None,
             ));
         }
-        if request.method == "skills/slow" {
+        if request.method == "example/skills/slow" {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         Ok(CustomResult::new(json!({
@@ -294,7 +297,7 @@ async fn typed_skills_request_survives_oauth_http_wrapper() -> anyhow::Result<()
         let client = ().serve(transport).await?;
         let response = client
             .send_request_as::<SkillsListResult>(ClientRequest::CustomRequest(CustomRequest::new(
-                "skills/list",
+                "example/skills/list",
                 Some(json!({})),
             )))
             .await;
@@ -470,7 +473,7 @@ async fn typed_custom_request_bypasses_the_core_response_union() -> anyhow::Resu
     let client = typed_test_client().await?;
     let response: SkillsListResult = client
         .send_request_as(ClientRequest::CustomRequest(CustomRequest::new(
-            "skills/list",
+            "example/skills/list",
             Some(json!({})),
         )))
         .await?;
@@ -492,7 +495,7 @@ async fn typed_custom_requests_preserve_errors_correlation_and_recovery() -> any
 
     let malformed = client
         .send_request_as::<SkillsListResult>(ClientRequest::CustomRequest(CustomRequest::new(
-            "skills/malformed",
+            "example/skills/malformed",
             None,
         )))
         .await;
@@ -503,14 +506,14 @@ async fn typed_custom_requests_preserve_errors_correlation_and_recovery() -> any
 
     let protocol_error = client
         .send_request_as::<SkillsListResult>(ClientRequest::CustomRequest(CustomRequest::new(
-            "skills/error",
+            "example/skills/error",
             None,
         )))
         .await;
     assert!(matches!(protocol_error, Err(ServiceError::McpError(_))));
 
     let typed = client.send_request_as::<SkillsListResult>(ClientRequest::CustomRequest(
-        CustomRequest::new("skills/list", None),
+        CustomRequest::new("example/skills/list", None),
     ));
     let standard = client.send_request(ClientRequest::PingRequest(PingRequest::default()));
     let (typed, standard) = tokio::join!(typed, standard);
@@ -526,7 +529,7 @@ async fn typed_custom_requests_use_standard_timeout_and_cancellation() -> anyhow
     let client = typed_test_client().await?;
     let handle = client
         .send_request_as_with_option::<SkillsListResult>(
-            ClientRequest::CustomRequest(CustomRequest::new("skills/slow", None)),
+            ClientRequest::CustomRequest(CustomRequest::new("example/skills/slow", None)),
             PeerRequestOptions::with_timeout(Duration::from_millis(10)),
         )
         .await?;
@@ -537,7 +540,7 @@ async fn typed_custom_requests_use_standard_timeout_and_cancellation() -> anyhow
 
     let recovered: SkillsListResult = client
         .send_request_as(ClientRequest::CustomRequest(CustomRequest::new(
-            "skills/list",
+            "example/skills/list",
             None,
         )))
         .await?;
@@ -558,7 +561,7 @@ impl ServerHandler for CancellationObservingServer {
         request: CustomRequest,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<CustomResult, rmcp::ErrorData> {
-        if request.method == "skills/list" {
+        if request.method == "example/skills/list" {
             return Ok(CustomResult::new(json!({
                 "resultType": "complete",
                 "skills": ["after-cancellation"],
@@ -592,7 +595,7 @@ async fn typed_custom_request_handle_sends_cancellation_to_the_peer() -> anyhow:
     let client = ().serve(client_transport).await?;
     let handle = client
         .send_request_as_with_option::<serde_json::Value>(
-            ClientRequest::CustomRequest(CustomRequest::new("skills/cancel", None)),
+            ClientRequest::CustomRequest(CustomRequest::new("example/skills/cancel", None)),
             PeerRequestOptions::no_options(),
         )
         .await?;
@@ -603,7 +606,7 @@ async fn typed_custom_request_handle_sends_cancellation_to_the_peer() -> anyhow:
 
     let following: SkillsListResult = client
         .send_request_as(ClientRequest::CustomRequest(CustomRequest::new(
-            "skills/list",
+            "example/skills/list",
             None,
         )))
         .await?;

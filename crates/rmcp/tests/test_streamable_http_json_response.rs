@@ -192,7 +192,7 @@ async fn streamable_http_preserves_typed_extension_results() -> anyhow::Result<(
     let client = ().serve(StreamableHttpClientTransport::from_uri(url)).await?;
     let result: TypedExtensionResult = client
         .send_request_as(rmcp::model::ClientRequest::CustomRequest(
-            CustomRequest::new("skills/list", None),
+            CustomRequest::new("example/skills/list", None),
         ))
         .await?;
     assert_eq!(result.result_type, "complete");

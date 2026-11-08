@@ -8,7 +8,7 @@ while IFS= read -r message; do
         *'"method":"initialize"'*)
             printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${request_id},\"result\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"serverInfo\":{\"name\":\"typed-stdio-fixture\",\"version\":\"1.0.0\"}}}"
             ;;
-        *'"method":"skills/list"'*)
+        *'"method":"example/skills/list"'*)
             printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${request_id},\"result\":{\"resultType\":\"complete\",\"skills\":[\"stdio-example\"],\"_meta\":{\"vendorExtension\":{\"retained\":true}}}}"
             ;;
         *'"method":"ping"'*)

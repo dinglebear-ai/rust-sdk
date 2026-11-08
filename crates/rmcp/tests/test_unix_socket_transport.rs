@@ -274,6 +274,56 @@ async fn test_unix_socket_response_body_cap() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A per-client cap can tighten, but cannot relax, the upstream JSON/error limits.
+#[tokio::test]
+async fn test_unix_socket_configured_cap_preserves_upstream_limits() -> anyhow::Result<()> {
+    for (status, content_type, max_size) in [
+        (StatusCode::OK, "application/json", 16 * 1024 * 1024),
+        (StatusCode::BAD_REQUEST, "text/plain", 64 * 1024),
+    ] {
+        let dir = TemporarySocketDirectory::new()?;
+        let socket_path = dir.0.join("mcp.sock");
+        let app = Router::new().route(
+            "/mcp",
+            post(move || async move {
+                (
+                    status,
+                    [(http::header::CONTENT_TYPE, content_type)],
+                    "x".repeat(max_size + 1),
+                )
+            }),
+        );
+        let listener = tokio::net::UnixListener::bind(&socket_path)?;
+        let _server_guard = AbortServerOnDrop(spawn_unix_server(listener, app));
+        let uri = "http://localhost/mcp";
+        let client = UnixSocketHttpClient::new(socket_path.to_str().unwrap(), uri)
+            .with_max_response_bytes(max_size + 1024);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.post_message(
+                Arc::from(uri),
+                ClientJsonRpcMessage::request(
+                    ClientRequest::PingRequest(PingRequest::default()),
+                    RequestId::Number(1),
+                ),
+                None,
+                None,
+                HashMap::new(),
+            ),
+        )
+        .await?;
+        assert!(
+            matches!(
+                result,
+                Err(StreamableHttpError::ResponseBodyTooLarge { max_size: actual })
+                    if actual == max_size
+            ),
+            "configured cap weakened the upstream {content_type} bound: {result:?}"
+        );
+    }
+    Ok(())
+}
+
 /// Integration test: MCP client connects and completes handshake over a Unix domain socket.
 #[tokio::test]
 async fn test_unix_socket_mcp_handshake() -> anyhow::Result<()> {

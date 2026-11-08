@@ -1,7 +1,7 @@
 use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
-use bytes::{Bytes, BytesMut};
-use futures::stream::BoxStream;
+use bytes::Bytes;
+use futures::{TryStreamExt, stream::BoxStream};
 use http::{HeaderName, HeaderValue, Method, Request, StatusCode, header::WWW_AUTHENTICATE};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -13,6 +13,9 @@ use crate::{
     model::ClientJsonRpcMessage,
     transport::{
         common::{
+            client_side_http::{
+                MAX_ERROR_RESPONSE_SIZE, MAX_JSON_RESPONSE_SIZE, read_bounded_body,
+            },
             client_side_sse::{DEFAULT_MAX_SSE_EVENT_SIZE, bounded_sse_stream},
             http_header::{
                 EVENT_STREAM_MIME_TYPE, HEADER_LAST_EVENT_ID, HEADER_SESSION_ID, JSON_MIME_TYPE,
@@ -161,22 +164,27 @@ async fn send_http_request(
 }
 
 async fn collect_response_body(
-    mut body: Incoming,
+    body: Incoming,
+    content_length: Option<u64>,
     max_response_bytes: Option<usize>,
-) -> Result<Bytes, UnixSocketError> {
-    let mut buffer = BytesMut::new();
-    while let Some(frame) = body.frame().await {
-        let frame = frame?;
-        if let Ok(data) = frame.into_data() {
-            if let Some(max_bytes) = max_response_bytes
-                && buffer.len().saturating_add(data.len()) > max_bytes
-            {
-                return Err(UnixSocketError::ResponseTooLarge { max_bytes });
-            }
-            buffer.extend_from_slice(&data);
+    default_limit: usize,
+) -> Result<Bytes, StreamableHttpError<UnixSocketError>> {
+    let limit = max_response_bytes.map_or(default_limit, |max| max.min(default_limit));
+    read_bounded_body(
+        body.into_data_stream().map_err(UnixSocketError::Hyper),
+        content_length,
+        limit,
+    )
+    .await
+    .map(Bytes::from)
+    .map_err(|error| match (error, max_response_bytes) {
+        (StreamableHttpError::ResponseBodyTooLarge { .. }, Some(max_bytes))
+            if max_bytes <= default_limit =>
+        {
+            StreamableHttpError::Client(UnixSocketError::ResponseTooLarge { max_bytes })
         }
-    }
-    Ok(buffer.freeze())
+        (error, _) => error,
+    })
 }
 
 /// Applies custom headers to a request builder, rejecting reserved headers.
@@ -301,11 +309,31 @@ impl StreamableHttpClient for UnixSocketHttpClient {
             return Err(StreamableHttpError::SessionExpired);
         }
 
+        let content_length = response
+            .headers()
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
         if !status.is_success() {
-            let body = collect_response_body(response.into_body(), self.max_response_bytes)
-                .await
-                .map_err(StreamableHttpError::Client)?;
-            let body = String::from_utf8_lossy(&body).into_owned();
+            let body = match collect_response_body(
+                response.into_body(),
+                content_length,
+                self.max_response_bytes,
+                MAX_ERROR_RESPONSE_SIZE,
+            )
+            .await
+            {
+                Ok(body) => String::from_utf8_lossy(&body).into_owned(),
+                Err(error @ StreamableHttpError::ResponseBodyTooLarge { .. }) => return Err(error),
+                Err(
+                    error @ StreamableHttpError::Client(UnixSocketError::ResponseTooLarge {
+                        ..
+                    }),
+                ) => {
+                    return Err(error);
+                }
+                Err(_) => "<failed to read response body>".to_owned(),
+            };
             if let Some(response) =
                 legacy_discover_response(&message, session_was_attached, status, &body)
             {
@@ -317,11 +345,6 @@ impl StreamableHttpClient for UnixSocketHttpClient {
         }
 
         let content_type = response.headers().get(http::header::CONTENT_TYPE).cloned();
-        let content_length = response
-            .headers()
-            .get(http::header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok());
         let session_id = response
             .headers()
             .get(HEADER_SESSION_ID)
@@ -347,9 +370,13 @@ impl StreamableHttpClient for UnixSocketHttpClient {
                 Ok(StreamableHttpPostResponse::Sse(sse_stream, session_id))
             }
             Some(ref ct) if ct.as_bytes().starts_with(JSON_MIME_TYPE.as_bytes()) => {
-                let body = collect_response_body(response.into_body(), self.max_response_bytes)
-                    .await
-                    .map_err(StreamableHttpError::Client)?;
+                let body = collect_response_body(
+                    response.into_body(),
+                    content_length,
+                    self.max_response_bytes,
+                    MAX_JSON_RESPONSE_SIZE,
+                )
+                .await?;
                 match serde_json::from_slice::<crate::service::RawRxJsonRpcMessage<crate::RoleClient>>(
                     &body,
                 ) {
