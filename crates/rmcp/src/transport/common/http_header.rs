@@ -44,6 +44,20 @@ pub(crate) fn validate_custom_header(name: &http::HeaderName) -> Result<(), Stri
     Ok(())
 }
 
+/// Preserve the full ordered challenge list across repeated header fields.
+/// A comma inside a field remains intact for the authentication parser.
+#[cfg(feature = "client-side-sse")]
+pub(crate) fn authentication_challenge_header(
+    headers: &http::HeaderMap,
+) -> Result<String, http::header::ToStrError> {
+    headers
+        .get_all(http::header::WWW_AUTHENTICATE)
+        .iter()
+        .map(http::HeaderValue::to_str)
+        .collect::<Result<Vec<_>, _>>()
+        .map(|fields| fields.join(", "))
+}
+
 /// Extracts the `scope=` parameter from a `WWW-Authenticate` header value.
 /// Handles both quoted (`scope="files:read files:write"`) and unquoted (`scope=read:data`) forms.
 #[cfg(feature = "client-side-sse")]
@@ -76,6 +90,21 @@ pub(crate) fn extract_scope_from_header(header: &str) -> Option<String> {
 mod tests {
     #[cfg(feature = "client-side-sse")]
     use super::*;
+
+    #[cfg(feature = "client-side-sse")]
+    #[test]
+    fn malformed_later_authentication_field_is_not_silently_ignored() {
+        let mut headers = http::HeaderMap::new();
+        headers.append(
+            http::header::WWW_AUTHENTICATE,
+            http::HeaderValue::from_static("Bearer error=\"insufficient_scope\", scope=\"read\""),
+        );
+        headers.append(
+            http::header::WWW_AUTHENTICATE,
+            http::HeaderValue::from_bytes(&[0xff]).unwrap(),
+        );
+        assert!(authentication_challenge_header(&headers).is_err());
+    }
 
     #[cfg(feature = "client-side-sse")]
     #[test]
