@@ -65,7 +65,44 @@ fn http_status_error(status: StatusCode, headers: &HeaderMap) -> Option<HttpStat
     Some(HttpStatusError::new(status.as_u16(), retry_after))
 }
 
-impl StreamableHttpClient for reqwest::Client {
+trait RequestSender {
+    fn request_client(&self) -> &reqwest::Client;
+    fn send_request(
+        &self,
+        builder: reqwest::RequestBuilder,
+    ) -> impl std::future::Future<
+        Output = Result<reqwest::Response, StreamableHttpError<reqwest::Error>>,
+    > + Send;
+}
+impl RequestSender for reqwest::Client {
+    fn request_client(&self) -> &reqwest::Client {
+        self
+    }
+    async fn send_request(
+        &self,
+        builder: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, StreamableHttpError<reqwest::Error>> {
+        Ok(builder.send().await?)
+    }
+}
+#[cfg(feature = "auth-dpop")]
+impl RequestSender for crate::transport::auth::dpop::DpopClient {
+    fn request_client(&self) -> &reqwest::Client {
+        self.http_client()
+    }
+    async fn send_request(
+        &self,
+        builder: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, StreamableHttpError<reqwest::Error>> {
+        self.send_resource_request(builder).await.map_err(|_| {
+            StreamableHttpError::UnexpectedServerResponse(Cow::Borrowed(
+                "DPoP resource request failed",
+            ))
+        })
+    }
+}
+macro_rules! impl_http_client { ($client:ty) => {
+impl StreamableHttpClient for $client {
     type Error = reqwest::Error;
 
     async fn get_stream(
@@ -96,7 +133,7 @@ impl StreamableHttpClient for reqwest::Client {
         custom_headers: HashMap<HeaderName, HeaderValue>,
         max_sse_event_size: usize,
     ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<Self::Error>> {
-        let mut request_builder = self
+        let mut request_builder = self.request_client()
             .get(uri.as_ref())
             .header(ACCEPT, [EVENT_STREAM_MIME_TYPE, JSON_MIME_TYPE].join(", "));
         if let Some(session_id) = session_id {
@@ -109,7 +146,7 @@ impl StreamableHttpClient for reqwest::Client {
             request_builder = request_builder.bearer_auth(auth_header);
         }
         request_builder = apply_custom_headers(request_builder, custom_headers)?;
-        let response = request_builder.send().await?;
+        let response = self.send_request(request_builder).await?;
         if response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED {
             return Err(StreamableHttpError::ServerDoesNotSupportSse);
         }
@@ -173,13 +210,13 @@ impl StreamableHttpClient for reqwest::Client {
         auth_token: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<(), StreamableHttpError<Self::Error>> {
-        let mut request_builder = self.delete(uri.as_ref());
+        let mut request_builder = self.request_client().delete(uri.as_ref());
         if let Some(auth_header) = auth_token {
             request_builder = request_builder.bearer_auth(auth_header);
         }
         request_builder = request_builder.header(HEADER_SESSION_ID, session.as_ref());
         request_builder = apply_custom_headers(request_builder, custom_headers)?;
-        let response = request_builder.send().await?;
+        let response = self.send_request(request_builder).await?;
 
         // if method no allowed
         if response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED {
@@ -218,7 +255,7 @@ impl StreamableHttpClient for reqwest::Client {
         custom_headers: HashMap<HeaderName, HeaderValue>,
         max_sse_event_size: usize,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
-        let mut request = self
+        let mut request = self.request_client()
             .post(uri.as_ref())
             .header(ACCEPT, [EVENT_STREAM_MIME_TYPE, JSON_MIME_TYPE].join(", "));
         if let Some(auth_header) = auth_token {
@@ -230,7 +267,7 @@ impl StreamableHttpClient for reqwest::Client {
         if let Some(session_id) = session_id {
             request = request.header(HEADER_SESSION_ID, session_id.as_ref());
         }
-        let response = request.json(&message).send().await?;
+        let response = self.send_request(request.json(&message)).await?;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED
             && let Some(header) = response.headers().get(WWW_AUTHENTICATE)
         {
@@ -421,6 +458,10 @@ impl StreamableHttpClient for reqwest::Client {
         }
     }
 }
+}; }
+impl_http_client!(reqwest::Client);
+#[cfg(feature = "auth-dpop")]
+impl_http_client!(crate::transport::auth::dpop::DpopClient);
 
 impl StreamableHttpClientTransport<reqwest::Client> {
     /// Creates a new transport using reqwest with the specified URI.
