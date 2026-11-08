@@ -261,9 +261,8 @@ pub struct StreamableHttpServerConfig {
     /// - `:*` matches any port.
     /// - An explicit port matches only that port. An `Origin` without a port
     ///   uses the scheme default (443 for `https`, 80 for `http`).
-    /// - An entry without a port currently matches any port. This is
-    ///   deprecated: a future release will match only the scheme default
-    ///   port. Use `:*` or an explicit port instead.
+    /// - An entry without a port matches only the scheme default port.
+    ///   Use `:*` to allow any port explicitly.
     ///
     /// Call [`StreamableHttpServerConfig::enforce_origin_validation`] to enable
     /// validation with an empty list, rejecting every present Origin value.
@@ -1132,6 +1131,10 @@ fn parse_origin_value(value: &str) -> Option<NormalizedOrigin> {
     if value.eq_ignore_ascii_case("null") {
         return Some(NormalizedOrigin::Null);
     }
+    let (_, serialized_authority) = value.split_once("://")?;
+    if serialized_authority.contains(['/', '?', '#', '@']) {
+        return None;
+    }
     let uri = http::Uri::try_from(value).ok()?;
     let scheme = uri.scheme_str()?.to_ascii_lowercase();
     let authority = uri.authority()?;
@@ -1155,7 +1158,7 @@ fn default_port(scheme: &str) -> Option<u16> {
 enum AllowedPort {
     /// `:*`
     Any,
-    /// No port in the entry. Matches any port until the deprecation ends.
+    /// No port in the entry. Matches only the scheme default port.
     Unspecified,
     Exact(u16),
 }
@@ -1163,7 +1166,10 @@ enum AllowedPort {
 impl AllowedPort {
     fn matches(self, scheme: &str, port: Option<u16>) -> bool {
         match self {
-            AllowedPort::Any | AllowedPort::Unspecified => true,
+            AllowedPort::Any => true,
+            AllowedPort::Unspecified => {
+                port.or_else(|| default_port(scheme)) == default_port(scheme)
+            }
             // RFC 6454 §6.2 omits the default port when serializing an origin.
             AllowedPort::Exact(allowed) => port.or_else(|| default_port(scheme)) == Some(allowed),
         }
@@ -1227,22 +1233,6 @@ fn origin_is_allowed(origin: &NormalizedOrigin, allowed_origins: &[String]) -> b
             ) => a_scheme == o_scheme && a_host == o_host && a_port.matches(o_scheme, *o_port),
             _ => false,
         })
-}
-
-fn warn_on_portless_allowed_origins(allowed_origins: &[String]) {
-    for raw in allowed_origins {
-        if let Some(AllowedOrigin::Tuple {
-            port: AllowedPort::Unspecified,
-            ..
-        }) = parse_allowed_origin(raw)
-        {
-            tracing::warn!(
-                allowed_origin = raw.as_str(),
-                "allowed origin without a port matches any port; a future release will match \
-                 only the scheme default port. Use `:*` or an explicit port instead",
-            );
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1361,9 +1351,14 @@ fn validate_origin_header(
     if !config.validate_empty_origin_allowlist && config.allowed_origins.is_empty() {
         return Ok(());
     }
-    let Some(origin_header) = headers.get(http::header::ORIGIN) else {
+    let mut origin_headers = headers.get_all(http::header::ORIGIN).iter();
+    let Some(origin_header) = origin_headers.next() else {
         return Ok(());
     };
+    if origin_headers.next().is_some() {
+        tracing::warn!("rejected request with multiple Origin headers");
+        return Err(forbidden_response("Forbidden: Multiple Origin headers").into());
+    }
     let origin_str = origin_header
         .to_str()
         .inspect_err(|_| {
@@ -1556,7 +1551,6 @@ where
         session_manager: Arc<M>,
         config: StreamableHttpServerConfig,
     ) -> Self {
-        warn_on_portless_allowed_origins(&config.allowed_origins);
         let pending_restores = config
             .session_store
             .is_some()

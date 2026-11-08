@@ -1125,7 +1125,10 @@ async fn test_server_falls_back_to_uri_authority_when_host_header_missing() {
 
 #[cfg(all(feature = "transport-streamable-http-server", feature = "server"))]
 mod origin_validation {
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use bytes::Bytes;
     use http::{HeaderValue, Method, Request, header::CONTENT_TYPE};
@@ -1358,12 +1361,12 @@ mod origin_validation {
     }
 
     #[tokio::test]
-    async fn omitted_configured_port_allows_any_origin_port() {
+    async fn omitted_configured_port_rejects_non_default_origin_port() {
         let service = service_with_allowed_origins(&["https://client.example"]);
         let response = service
             .handle(init_request(Some("https://client.example:8443")))
             .await;
-        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(response.status(), http::StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -1400,5 +1403,86 @@ mod origin_validation {
             .handle(init_request(Some("http://client.example:8443")))
             .await;
         assert_eq!(response.status(), http::StatusCode::FORBIDDEN);
+    }
+
+    fn service_with_allowed_origins_and_counter(
+        origins: &[&str],
+        handler_creations: Arc<AtomicUsize>,
+    ) -> StreamableHttpService<TestHandler, LocalSessionManager> {
+        StreamableHttpService::new(
+            move || {
+                handler_creations.fetch_add(1, Ordering::SeqCst);
+                Ok(TestHandler)
+            },
+            Arc::new(LocalSessionManager::default()),
+            StreamableHttpServerConfig::default().with_allowed_origins(origins.iter().copied()),
+        )
+    }
+
+    #[tokio::test]
+    async fn non_utf8_origin_is_forbidden_before_handler_creation() {
+        let handler_creations = Arc::new(AtomicUsize::new(0));
+        let service = service_with_allowed_origins_and_counter(
+            &["http://localhost:8080"],
+            handler_creations.clone(),
+        );
+        let mut request = init_request(None);
+        request.headers_mut().insert(
+            http::header::ORIGIN,
+            http::HeaderValue::from_bytes(b"\xff").expect("opaque header value"),
+        );
+
+        let response = service.handle(request).await;
+
+        assert_eq!(response.status(), http::StatusCode::FORBIDDEN);
+        assert_eq!(handler_creations.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn multiple_origin_headers_are_forbidden() {
+        let service = service_with_allowed_origins(&["http://localhost:8080"]);
+        let mut request = init_request(Some("http://localhost:8080"));
+        request.headers_mut().append(
+            http::header::ORIGIN,
+            "http://attacker.example".parse().unwrap(),
+        );
+        let response = service.handle(request).await;
+        assert_eq!(response.status(), http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn origin_with_non_origin_components_is_forbidden() {
+        for origin in [
+            "http://localhost:8080/",
+            "http://localhost:8080/evil",
+            "http://localhost:8080?query=1",
+            "http://user@localhost:8080",
+            "http://localhost:8080#fragment",
+        ] {
+            let service = service_with_allowed_origins(&["http://localhost:8080"]);
+            let response = service.handle(init_request(Some(origin))).await;
+            assert_eq!(response.status(), http::StatusCode::FORBIDDEN, "{origin}");
+        }
+    }
+
+    #[tokio::test]
+    async fn allowlisted_origin_does_not_wildcard_an_unexpected_port() {
+        let service = service_with_allowed_origins(&["https://app.example"]);
+        let response = service
+            .handle(init_request(Some("https://app.example:9443")))
+            .await;
+        assert_eq!(response.status(), http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn default_origin_ports_are_equivalent() {
+        for (allowed, presented) in [
+            ("http://localhost", "http://localhost:80"),
+            ("https://localhost:443", "https://localhost"),
+        ] {
+            let service = service_with_allowed_origins(&[allowed]);
+            let response = service.handle(init_request(Some(presented))).await;
+            assert_eq!(response.status(), http::StatusCode::OK);
+        }
     }
 }
