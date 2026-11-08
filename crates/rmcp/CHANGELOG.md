@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Use native upstream Skills and remove the obsolete typed/raw-response API patch.
 - Allow an explicit bounded Unix-socket JSON response budget; retain the 64 KiB error ceiling.
 - Expose opt-in MCP Events capability metadata.
+- Preserve workload JWT bearer grants, bounded SSE reconnect policy, and repeated authentication challenges used by existing clients.
 - Reject duplicate or malformed Origin headers and require the default port for portless allowlist entries; explicit `:*` entries retain upstream wildcard support.
 
 ## [3.9.0](https://github.com/modelcontextprotocol/rust-sdk/compare/rmcp-v3.8.0...rmcp-v3.9.0) - 2026-11-05
