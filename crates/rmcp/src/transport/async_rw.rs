@@ -15,9 +15,7 @@ use tokio_util::{
 use super::{IntoTransport, Transport};
 use crate::{
     model::ErrorData,
-    service::{
-        RawRxJsonRpcMessage, RxJsonRpcMessage, ServiceRole, TxJsonRpcMessage, decode_peer_response,
-    },
+    service::{RxJsonRpcMessage, ServiceRole, TxJsonRpcMessage},
 };
 
 #[non_exhaustive]
@@ -233,10 +231,6 @@ where
 {
     type Error = std::io::Error;
 
-    fn preserves_raw_responses() -> bool {
-        true
-    }
-
     fn send(
         &mut self,
         item: TxJsonRpcMessage<Role>,
@@ -256,18 +250,6 @@ where
     }
 
     async fn receive(&mut self) -> Option<RxJsonRpcMessage<Role>> {
-        loop {
-            let message = self.receive_raw().await?;
-            match decode_peer_response::<Role>(message) {
-                Ok(message) => return Some(message),
-                Err(error) => {
-                    tracing::debug!(%error, "Ignoring response with invalid result shape")
-                }
-            }
-        }
-    }
-
-    async fn receive_raw(&mut self) -> Option<RawRxJsonRpcMessage<Role>> {
         loop {
             if let Some(state) = self.pending_error_response.as_mut() {
                 let mut write = self.write.lock().await;
@@ -324,7 +306,7 @@ where
                     self.line_buf.clear();
                     continue;
                 }
-                try_parse_with_compatibility::<RawRxJsonRpcMessage<Role>>(line, "receive")
+                try_parse_with_compatibility::<RxJsonRpcMessage<Role>>(line, "receive")
             };
             self.line_buf.clear();
             match parsed {

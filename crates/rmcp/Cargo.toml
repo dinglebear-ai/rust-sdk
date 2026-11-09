@@ -19,6 +19,7 @@ exhaustive_enums = "warn"
 features = [
   "auth",
   "auth-client-credentials-jwt",
+  "auth-dpop",
   "auth-enterprise-managed",
   "base64",
   "client",
@@ -60,6 +61,8 @@ pin-project-lite = "0.2"
 pastey = { version = "0.2.0", optional = true }
 # oauth2 support
 oauth2 = { version = "5.0", optional = true, default-features = false }
+aws-lc-rs = { version = "1", optional = true }
+
 # JWT signing for client credentials (private_key_jwt)
 jsonwebtoken = { version = "11", optional = true, features = ["aws_lc_rs"] }
 
@@ -71,6 +74,11 @@ base64 = { version = "0.23", optional = true }
 
 # SHA-256 for SEP-2640 skill digests and SEP-2322 requestState sealing
 sha2 = "0.11"
+
+# SKILL.md frontmatter for the `skills-fs` catalog
+yaml_serde = { version = "0.10", optional = true }
+# reads the `skills-fs` catalog through a root handle that cannot escape it
+cap-std = { version = "4", optional = true }
 
 # for SEP-2322 requestState integrity sealing (opt-in via the `request-state` feature)
 hmac = { version = "0.13", optional = true }
@@ -139,6 +147,7 @@ elicitation = ["dep:url"]
 
 # SEP-2322 requestState integrity helper (HMAC-SHA256 seal/open codec)
 request-state = ["dep:hmac", "dep:zeroize", "base64"]
+skills-fs = ["server", "base64", "dep:cap-std", "dep:yaml_serde"]
 
 # reqwest http client
 __reqwest = ["dep:reqwest"]
@@ -206,6 +215,7 @@ tower = ["dep:tower-service"]
 auth = ["dep:async-trait", "dep:oauth2", "__reqwest", "dep:url"]
 auth-client-credentials-jwt = ["auth", "dep:jsonwebtoken", "uuid"]
 auth-enterprise-managed = ["auth", "base64"]
+auth-dpop = ["auth", "base64", "dep:aws-lc-rs", "transport-streamable-http-client-reqwest"]
 schemars = ["dep:schemars"]
 
 [dev-dependencies]
@@ -224,6 +234,7 @@ tracing-subscriber = { version = "0.3", features = [
 ] }
 async-trait = "0.1"
 rstest = "0.28.0"
+tempfile = "3"
 # Cargo unifies this feature into rmcp whenever any crate in a build enables it,
 # so the tests run with it on (see tests/test_deserialization.rs).
 serde_json = { version = "1.0", features = ["arbitrary_precision"] }
@@ -306,7 +317,7 @@ path = "tests/test_streamable_http_priming.rs"
 
 [[test]]
 name = "test_streamable_http_json_response"
-required-features = ["server", "client", "transport-streamable-http-server", "transport-streamable-http-client-reqwest"]
+required-features = ["server", "client", "transport-streamable-http-server", "reqwest"]
 path = "tests/test_streamable_http_json_response.rs"
 
 [[test]]

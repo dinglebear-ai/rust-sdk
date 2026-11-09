@@ -75,8 +75,6 @@ impl ServiceRole for RoleServer {
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum ServerInitializeError {
-    #[error("failed to deserialize initialization response: {0}")]
-    ResponseDeserialization(#[source] serde_json::Error),
     #[error("expect initialized request, but received: {0:?}")]
     ExpectedInitializeRequest(Option<ClientJsonRpcMessage>),
 
@@ -431,12 +429,10 @@ async fn expect_next_message<T>(
 where
     T: Transport<RoleServer>,
 {
-    let message = transport
-        .receive_raw()
+    transport
+        .receive()
         .await
-        .ok_or_else(|| ServerInitializeError::ConnectionClosed(context.to_string()))?;
-    super::decode_peer_response::<RoleServer>(message)
-        .map_err(ServerInitializeError::ResponseDeserialization)
+        .ok_or_else(|| ServerInitializeError::ConnectionClosed(context.to_string()))
 }
 
 pub async fn serve_server_with_ct<S, T, E, A>(

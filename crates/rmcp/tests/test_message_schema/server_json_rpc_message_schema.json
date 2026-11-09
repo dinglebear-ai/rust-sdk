@@ -3281,6 +3281,14 @@
           ],
           "additionalProperties": true
         },
+        "events": {
+          "description": "MCP Events support. Method implementations and delivery are server-owned.",
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true
+        },
         "experimental": {
           "type": [
             "object",

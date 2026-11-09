@@ -94,12 +94,6 @@ pub enum ServiceError {
     /// The peer kept returning `input_required` beyond the configured round cap.
     #[error("input_required did not complete within {max_rounds} MRTR rounds")]
     InputRequiredRoundsExceeded { max_rounds: usize },
-    /// A response could not be decoded as the type requested by the caller.
-    #[error("failed to deserialize response: {0}")]
-    ResponseDeserialization(#[source] serde_json::Error),
-    /// The selected transport cannot retain an extension response's raw result.
-    #[error("transport does not preserve raw response results required by typed requests")]
-    RawResponseUnavailable,
 }
 
 trait TransferObject:
@@ -282,29 +276,6 @@ pub type RxJsonRpcMessage<R> = JsonRpcMessage<
     <R as ServiceRole>::PeerResp,
     <R as ServiceRole>::PeerNot,
 >;
-/// A received JSON-RPC message whose response result remains raw JSON.
-///
-/// Requests and notifications retain the peer types defined by `R`; only a
-/// successful response's result is represented as [`serde_json::Value`]. This
-/// prevents extension fields from being lost to the role's core response union
-/// before a typed request can deserialize them.
-pub type RawRxJsonRpcMessage<R> =
-    JsonRpcMessage<<R as ServiceRole>::PeerReq, serde_json::Value, <R as ServiceRole>::PeerNot>;
-
-pub(crate) fn decode_peer_response<R: ServiceRole>(
-    message: RawRxJsonRpcMessage<R>,
-) -> Result<RxJsonRpcMessage<R>, serde_json::Error> {
-    Ok(match message {
-        JsonRpcMessage::Request(request) => JsonRpcMessage::Request(request),
-        JsonRpcMessage::Response(response) => JsonRpcMessage::Response(JsonRpcResponse {
-            jsonrpc: response.jsonrpc,
-            id: response.id,
-            result: serde_json::from_value(response.result)?,
-        }),
-        JsonRpcMessage::Notification(notification) => JsonRpcMessage::Notification(notification),
-        JsonRpcMessage::Error(error) => JsonRpcMessage::Error(error),
-    })
-}
 
 #[cfg(not(feature = "local"))]
 pub trait Service<R: ServiceRole>: Send + Sync + 'static {
@@ -362,6 +333,17 @@ pub trait ServiceExt<R: ServiceRole>: Service<R> + Sized {
     fn into_dyn(self) -> Box<dyn DynService<R>> {
         Box::new(self)
     }
+    /// Initialize the protocol over `transport` and return a running service.
+    ///
+    /// On a server, this waits for peer input that establishes a protocol
+    /// lifecycle, such as a legacy `initialize` request. A stdio server normally
+    /// runs as a child process of an MCP client; starting it in a terminal with
+    /// no protocol input leaves this future pending.
+    ///
+    /// Once this returns, the service handles messages in the background and
+    /// other asynchronous work can run. Use [`RunningService::waiting`] to wait
+    /// for shutdown or [`RunningService::cancel`] to stop the running service.
+    /// Use [`Self::serve_with_ct`] to supply a cancellation token during startup.
     fn serve<T, E, A>(
         self,
         transport: T,
@@ -373,6 +355,15 @@ pub trait ServiceExt<R: ServiceRole>: Service<R> + Sized {
     {
         Self::serve_with_ct(self, transport, Default::default())
     }
+    /// Initialize and run the service with the supplied cancellation token.
+    ///
+    /// Like [`Self::serve`], this waits for protocol initialization before
+    /// returning a [`RunningService`]. Cancelling `ct` interrupts initialization
+    /// or signals shutdown of the running service.
+    ///
+    /// Transport shutdown can have additional constraints: Tokio's standard
+    /// input uses a blocking read that cancellation cannot interrupt. See
+    /// <https://docs.rs/tokio/latest/tokio/io/fn.stdin.html>.
     fn serve_with_ct<T, E, A>(
         self,
         transport: T,
@@ -553,23 +544,22 @@ impl ProgressNotificationToken for ServerNotification {
 
 type Responder<T> = tokio::sync::oneshot::Sender<T>;
 struct PendingResponse<T> {
-    responder: T,
+    responder: Responder<T>,
     is_subscription: bool,
 }
 type ProgressTimeoutWatchers = Arc<tokio::sync::RwLock<HashMap<ProgressToken, mpsc::Sender<()>>>>;
 type SubscriptionChannel<N> = (mpsc::Sender<N>, usize);
 type SubscriptionChannelMap<N> = HashMap<RequestId, SubscriptionChannel<N>>;
 
-/// A handle to a remote request whose response resolves to `T`.
+/// A handle to a remote request
 ///
-/// `T` defaults to the role's core peer-response union. Typed extension
-/// requests created by [`Peer::send_request_as_with_option`] instead use the
-/// caller's concrete result type. Call [`RequestHandle::cancel`] to cancel the
-/// request with a reason, or [`RequestHandle::await_response`] to await it.
+/// You can cancel it by call [`RequestHandle::cancel`] with a reason,
+///
+/// or wait for response by call [`RequestHandle::await_response`]
 #[derive(Debug)]
 #[non_exhaustive]
-pub struct RequestHandle<R: ServiceRole, T = <R as ServiceRole>::PeerResp> {
-    pub rx: tokio::sync::oneshot::Receiver<Result<T, ServiceError>>,
+pub struct RequestHandle<R: ServiceRole> {
+    pub rx: tokio::sync::oneshot::Receiver<Result<R::PeerResp, ServiceError>>,
     pub options: PeerRequestOptions,
     pub peer: Peer<R>,
     pub id: RequestId,
@@ -577,11 +567,11 @@ pub struct RequestHandle<R: ServiceRole, T = <R as ServiceRole>::PeerResp> {
     progress_reset_rx: Option<mpsc::Receiver<()>>,
 }
 
-impl<R: ServiceRole, T> RequestHandle<R, T> {
+impl<R: ServiceRole> RequestHandle<R> {
     pub const REQUEST_TIMEOUT_REASON: &str = "request timeout";
     pub const REQUEST_MAX_TOTAL_TIMEOUT_REASON: &str = "maximum total timeout exceeded";
 
-    pub async fn await_response(mut self) -> Result<T, ServiceError> {
+    pub async fn await_response(mut self) -> Result<R::PeerResp, ServiceError> {
         let timeout = self.options.timeout;
         let max_total_timeout = self.options.max_total_timeout;
         let reset_timeout_on_progress = self.options.reset_timeout_on_progress;
@@ -643,7 +633,7 @@ impl<R: ServiceRole, T> RequestHandle<R, T> {
         timeout: Option<Duration>,
         max_total_timeout: Option<Duration>,
         reset_timeout_on_progress: bool,
-    ) -> Result<T, ServiceError> {
+    ) -> Result<R::PeerResp, ServiceError> {
         let mut idle_sleep =
             timeout.map(|timeout| (timeout, Box::pin(tokio::time::sleep(timeout))));
         let mut max_total_sleep =
@@ -727,61 +717,12 @@ impl<R: ServiceRole, T> RequestHandle<R, T> {
     }
 }
 
-pub(crate) enum PendingResponder<R: ServiceRole> {
-    Standard(Responder<Result<R::PeerResp, ServiceError>>),
-    Typed(Box<dyn FnOnce(Result<serde_json::Value, ServiceError>) + Send>),
-}
-
-impl<R: ServiceRole> std::fmt::Debug for PendingResponder<R> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self {
-            Self::Standard(_) => "PendingResponder::Standard",
-            Self::Typed(_) => "PendingResponder::Typed",
-        })
-    }
-}
-
-impl<R: ServiceRole> PendingResponder<R> {
-    fn requires_raw_response(&self) -> bool {
-        matches!(self, Self::Typed(_))
-    }
-
-    fn send_error(self, error: ServiceError) {
-        match self {
-            Self::Standard(responder) => {
-                let _ = responder.send(Err(error));
-            }
-            Self::Typed(responder) => responder(Err(error)),
-        }
-    }
-
-    fn send_result(self, value: serde_json::Value) {
-        match self {
-            Self::Standard(responder) => {
-                let result =
-                    serde_json::from_value(value).map_err(ServiceError::ResponseDeserialization);
-                let _ = responder.send(result);
-            }
-            Self::Typed(responder) => responder(Ok(value)),
-        }
-    }
-
-    fn send_standard_result(self, value: R::PeerResp) {
-        match self {
-            Self::Standard(responder) => {
-                let _ = responder.send(Ok(value));
-            }
-            Self::Typed(responder) => responder(Err(ServiceError::RawResponseUnavailable)),
-        }
-    }
-}
-
 #[derive(Debug)]
 pub(crate) enum PeerSinkMessage<R: ServiceRole> {
     Request {
         request: R::Req,
         id: RequestId,
-        responder: PendingResponder<R>,
+        responder: Responder<Result<R::PeerResp, ServiceError>>,
     },
     Notification {
         notification: R::Not,
@@ -928,55 +869,6 @@ impl<R: ServiceRole> Peer<R> {
             .await
     }
 
-    /// Send a request and deserialize its result directly as `T`.
-    ///
-    /// This is intended for extension methods whose result type is not part of
-    /// the role's core response union. Decoding the result as the caller's
-    /// concrete type avoids ambiguous `#[serde(untagged)]` union matching.
-    /// The caller is responsible for pairing the request method with its
-    /// correct result type.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ServiceError::RawResponseUnavailable`] without sending the
-    /// request when the selected transport cannot preserve raw result JSON.
-    /// Returns [`ServiceError::ResponseDeserialization`] when the received
-    /// result does not deserialize as `T`. Transport, peer, timeout, and
-    /// cancellation errors are returned unchanged.
-    pub async fn send_request_as<T>(&self, request: R::Req) -> Result<T, ServiceError>
-    where
-        T: serde::de::DeserializeOwned + Send + 'static,
-    {
-        self.send_request_as_with_option(request, PeerRequestOptions::no_options())
-            .await?
-            .await_response()
-            .await
-    }
-
-    /// Send a typed request with the same timeout, metadata, progress, and
-    /// cancellation lifecycle available to core requests.
-    ///
-    /// Raw-response support and error behavior are the same as
-    /// [`Peer::send_request_as`].
-    pub async fn send_request_as_with_option<T>(
-        &self,
-        request: R::Req,
-        options: PeerRequestOptions,
-    ) -> Result<RequestHandle<R, T>, ServiceError>
-    where
-        T: serde::de::DeserializeOwned + Send + 'static,
-    {
-        self.send_request_with_option_and_subscription(request, options, None, |responder| {
-            PendingResponder::Typed(Box::new(move |result| {
-                let result = result.and_then(|value| {
-                    serde_json::from_value(value).map_err(ServiceError::ResponseDeserialization)
-                });
-                let _ = responder.send(result);
-            }))
-        })
-        .await
-    }
-
     pub async fn send_cancellable_request(
         &self,
         request: R::Req,
@@ -990,22 +882,16 @@ impl<R: ServiceRole> Peer<R> {
         request: R::Req,
         options: PeerRequestOptions,
     ) -> Result<RequestHandle<R>, ServiceError> {
-        self.send_request_with_option_and_subscription(
-            request,
-            options,
-            None,
-            PendingResponder::Standard,
-        )
-        .await
+        self.send_request_with_option_and_subscription(request, options, None)
+            .await
     }
 
-    async fn send_request_with_option_and_subscription<T>(
+    async fn send_request_with_option_and_subscription(
         &self,
         mut request: R::Req,
         options: PeerRequestOptions,
         subscription_sender: Option<SubscriptionChannel<R::PeerNot>>,
-        wrap_responder: impl FnOnce(Responder<Result<T, ServiceError>>) -> PendingResponder<R>,
-    ) -> Result<RequestHandle<R, T>, ServiceError> {
+    ) -> Result<RequestHandle<R>, ServiceError> {
         R::enforce_outbound_request(self)?;
         if let Ok(originating) = ORIGINATING_REQUEST.try_with(|id| id.clone()) {
             request
@@ -1046,7 +932,7 @@ impl<R: ServiceRole> Peer<R> {
             .send(PeerSinkMessage::Request {
                 request,
                 id: id.clone(),
-                responder: wrap_responder(responder),
+                responder,
             })
             .await
             .is_err()
@@ -1083,7 +969,6 @@ impl<R: ServiceRole> Peer<R> {
                 request,
                 options,
                 Some((sender, channel_capacity)),
-                PendingResponder::Standard,
             )
             .await?;
         Ok((handle, receiver))
@@ -1508,7 +1393,7 @@ where
     }
 
     let mut local_responder_pool =
-        HashMap::<RequestId, PendingResponse<PendingResponder<R>>>::new();
+        HashMap::<RequestId, PendingResponse<Result<R::PeerResp, ServiceError>>>::new();
     let mut local_ct_pool = HashMap::<RequestId, CancellationToken>::new();
     let shared_service = Arc::new(service);
     // for return
@@ -1539,17 +1424,17 @@ where
         #[derive(Debug)]
         enum Event<R: ServiceRole> {
             ProxyMessage(PeerSinkMessage<R>),
-            PeerMessage(RawRxJsonRpcMessage<R>),
-            LegacyPeerMessage(RxJsonRpcMessage<R>),
+            PeerMessage(RxJsonRpcMessage<R>),
             ToSink(TxJsonRpcMessage<R>),
             SendTaskResult(SendTaskResult),
             ResponseSendTaskResult(Result<(), tokio::task::JoinError>),
         }
 
         let quit_reason = loop {
-            let evt = if let Some(message) = batch_messages.pop_front() {
-                Event::LegacyPeerMessage(message)
-            } else { tokio::select! {
+            let evt = if let Some(m) = batch_messages.pop_front() {
+                Event::PeerMessage(m)
+            } else {
+                tokio::select! {
                     m = sink_proxy_rx.recv(), if !sink_proxy_rx.is_closed() => {
                         if let Some(m) = m {
                             Event::ToSink(m)
@@ -1557,15 +1442,9 @@ where
                             continue
                         }
                     }
-                    m = async {
-                        if T::preserves_raw_responses() {
-                            transport.receive_raw().await.map(Event::PeerMessage)
-                        } else {
-                            transport.receive().await.map(Event::LegacyPeerMessage)
-                        }
-                    } => {
-                        if let Some(event) = m {
-                            event
+                    m = transport.receive() => {
+                        if let Some(m) = m {
+                            Event::PeerMessage(m)
                         } else {
                             // input stream closed
                             tracing::info!("input stream terminated");
@@ -1606,37 +1485,12 @@ where
                 }
             };
 
-            let evt = match evt {
-                Event::LegacyPeerMessage(JsonRpcMessage::Response(JsonRpcResponse {
-                    result,
-                    id,
-                    ..
-                })) => {
-                    if let Some(responder) =
-                        remove_pending_request(&mut local_responder_pool, &id)
-                    {
-                        responder.responder.send_standard_result(result);
-                    }
-                    continue;
-                }
-                Event::LegacyPeerMessage(JsonRpcMessage::Request(request)) => {
-                    Event::PeerMessage(JsonRpcMessage::Request(request))
-                }
-                Event::LegacyPeerMessage(JsonRpcMessage::Notification(notification)) => {
-                    Event::PeerMessage(JsonRpcMessage::Notification(notification))
-                }
-                Event::LegacyPeerMessage(JsonRpcMessage::Error(error)) => {
-                    Event::PeerMessage(JsonRpcMessage::Error(error))
-                }
-                event => event,
-            };
-
             tracing::trace!(?evt, "new event");
             match evt {
                 Event::SendTaskResult(SendTaskResult::Request { id, result }) => {
                     if let Err(e) = result
                         && let Some(responder) = local_responder_pool.remove(&id) {
-                            responder.responder.send_error(ServiceError::TransportSend(e));
+                            let _ = responder.responder.send(Err(ServiceError::TransportSend(e)));
                         }
                 }
                 Event::SendTaskResult(SendTaskResult::Notification {
@@ -1654,9 +1508,9 @@ where
                         && let Some(request_id) = &param.request_id
                             && let Some(responder) = local_responder_pool.remove(request_id) {
                                 tracing::info!(id = %request_id, reason = param.reason, "cancelled");
-                                responder.responder.send_error(ServiceError::Cancelled {
+                                let _response_result = responder.responder.send(Err(ServiceError::Cancelled {
                                     reason: param.reason.clone(),
-                                });
+                                }));
                             }
                 }
                 Event::ResponseSendTaskResult(result) => {
@@ -1691,10 +1545,6 @@ where
                     id,
                     responder,
                 }) => {
-                    if responder.requires_raw_response() && !T::preserves_raw_responses() {
-                        responder.send_error(ServiceError::RawResponseUnavailable);
-                        continue;
-                    }
                     local_responder_pool.insert(id.clone(), PendingResponse {
                         responder,
                         is_subscription: R::is_subscription_request(&request),
@@ -1817,9 +1667,9 @@ where
                                         .is_some_and(|pending| pending.is_subscription)
                                         && let Some(pending) = local_responder_pool.remove(request_id)
                                     {
-                                        pending.responder.send_error(ServiceError::Cancelled {
+                                        let _ = pending.responder.send(Err(ServiceError::Cancelled {
                                             reason: cancelled.reason.clone(),
-                                        });
+                                        }));
                                     } else {
                                         tracing::debug!(%request_id, "ignoring cancellation of unknown subscription");
                                         continue;
@@ -1854,7 +1704,8 @@ where
                                     && let Some(responder) =
                                         local_responder_pool.remove(&subscription_id)
                                 {
-                                    responder.responder.send_error(ServiceError::SubscriptionLagged { capacity });
+                                    let _ = responder.responder
+                                        .send(Err(ServiceError::SubscriptionLagged { capacity }));
                                 }
                                 peer.unregister_subscription(&subscription_id);
                                 peer.try_cancel_request(
@@ -1905,7 +1756,10 @@ where
                     if let Some(responder) =
                         remove_pending_request(&mut local_responder_pool, &id)
                     {
-                        responder.responder.send_result(result);
+                        let response_result = responder.responder.send(Ok(result));
+                        if let Err(_error) = response_result {
+                            tracing::warn!(%id, "Error sending response");
+                        }
                     }
                 }
                 Event::PeerMessage(JsonRpcMessage::Error(JsonRpcError { error, id, .. })) => {
@@ -1923,10 +1777,12 @@ where
                         } else {
                             ServiceError::McpError(error)
                         };
-                        responder.responder.send_error(service_error);
+                        let _response_result = responder.responder.send(Err(service_error));
+                        if let Err(_error) = _response_result {
+                            tracing::warn!(%id, "Error sending response");
+                        }
                     }
                 }
-                Event::LegacyPeerMessage(_) => unreachable!("legacy messages are normalized above"),
             }
         };
 
